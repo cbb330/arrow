@@ -15,6 +15,23 @@
 # specific language governing permissions and limitations
 # under the License.
 
+"""
+Apache ORC file format with predicate pushdown support.
+
+ORC supports stripe-level filtering using column statistics for INT32/INT64 columns.
+
+**Dataset API** (recommended for multiple files)::
+
+    >>> import pyarrow.dataset as ds
+    >>> dataset = ds.dataset('data.orc', format='orc')
+    >>> table = dataset.to_table(filter=ds.field('value') > 100)
+
+**Convenience API** (single file)::
+
+    >>> import pyarrow.orc as orc
+    >>> table = orc.read_table('data.orc', filters=ds.field('value') > 100)
+    >>> table = orc.read_table('data.orc', filters=[('value', '>', 100)])  # DNF tuples
+"""
 
 from numbers import Integral
 import warnings
@@ -297,7 +314,16 @@ where : str or pyarrow.io.NativeFile
             self.is_open = False
 
 
-def read_table(source, columns=None, filesystem=None):
+def read_table(source, columns=None, filesystem=None, filters=None):
+    if filters is not None:
+        import pyarrow.dataset as ds
+        from pyarrow.parquet.core import filters_to_expression
+
+        # filters_to_expression handles both Expression and DNF tuple formats
+        filter_expr = filters_to_expression(filters)
+        dataset = ds.dataset(source, format='orc', filesystem=filesystem)
+        return dataset.to_table(columns=columns, filter=filter_expr)
+
     filesystem, path = _resolve_filesystem_and_path(source, filesystem)
     if filesystem is not None:
         source = filesystem.open_input_file(path)
@@ -330,6 +356,44 @@ filesystem : FileSystem, default None
     If nothing passed, will be inferred based on path.
     Path will try to be found in the local on-disk filesystem otherwise
     it will be parsed as an URI to determine the filesystem.
+filters : pyarrow.compute.Expression or List[Tuple] or List[List[Tuple]], default None
+    Predicate expression to filter rows. Uses ORC stripe-level statistics for
+    optimization when possible.
+
+    Accepts Expression objects or DNF (Disjunctive Normal Form) tuples::
+
+        # Expression format
+        filters=ds.field('id') > 100
+
+        # DNF tuples: list of conditions (AND), or list of lists (OR of ANDs)
+        filters=[('id', '>', 100)]                      # single condition
+        filters=[('id', '>', 100), ('id', '<', 200)]    # AND
+        filters=[[('x', '==', 1)], [('x', '==', 2)]]    # OR
+
+    Supported operators: ==, !=, <, >, <=, >=, in, not in
+
+    Note: When filters is specified, the dataset API is used internally.
+
+Returns
+-------
+pyarrow.Table
+    Content of the file as a Table.
+
+Examples
+--------
+Read entire file:
+
+>>> import pyarrow.orc as orc
+>>> table = orc.read_table('data.orc')
+
+Read with predicate pushdown:
+
+>>> import pyarrow.dataset as ds
+>>> table = orc.read_table('data.orc', filters=ds.field('id') > 1000)
+
+Read with column selection and filtering:
+
+>>> table = orc.read_table('data.orc', columns=['id', 'value'], filters=[('id', '>', 1000)])
 """
 
 
