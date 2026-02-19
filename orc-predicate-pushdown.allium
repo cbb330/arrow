@@ -1,0 +1,1943 @@
+-- allium: 1
+-- orc-predicate-pushdown.allium
+--
+-- Apache Arrow Dataset Scanning with ORC Predicate Pushdown
+--
+-- Scope: Predicate pushdown flow from Scanner through Fragment to ORC stripes
+-- Includes: OrcFile, Stripe, StripeStatistics, Predicate, FilterStripes, Dataset integration
+-- Excludes:
+--   - ORC file writing (separate feature)
+--   - Row-level filtering (handled by scanner after stripe selection)
+--   - ORC encoding/decoding internals
+--   - Schema evolution details (covered separately)
+
+
+-- =============================================================================
+-- ENTITY RELATIONSHIPS
+-- =============================================================================
+--
+-- Dataset (contains)──────────────────────────────→ Fragment* (1:N)
+--    │                                                  │
+--    │ FileSystemDataset                                │ FileFragment
+--    │    └── partitioning: Partitioning                │    └── source: FileSource
+--    │    └── fragments: List<FileFragment>             │    └── format: FileFormat
+--    │                                                  │
+--    │                                                  │ OrcFileFragment
+--    │                                                  │    └── stripes: List<Int>?
+--    │                                                  │    └── metadata: OrcFileMetadata?
+--    │                                                  │    └── manifest: OrcSchemaManifest?
+--    │                                                  │    └── statistics_cache: StripeStatisticsCache?
+--    │                                                  │
+--    └── schema: Schema                                 └── physical_schema: Schema
+--    └── partition_expression: Expression               └── partition_expression: Expression
+--
+--
+-- Scanner (uses)──────────────────────────────────→ Dataset (1:1)
+--    │
+--    └── options: ScanOptions
+--           └── filter: Expression
+--           └── projection: Expression
+--           └── dataset_schema: Schema
+--           └── projected_schema: Schema
+--
+--
+-- OrcFileMetadata (contains)────────────────────────→ StripeMetadata* (1:N)
+--                                                          │
+--                                                          └── ColumnStatistics*
+--                                                                 └── min, max, has_null
+--
+--
+-- OrcSchemaManifest (contains)──────────────────────→ OrcSchemaField* (1:N)
+--    │                                                  │
+--    └── num_columns: Int                               └── field: Field
+--                                                       └── column_index: Int?
+--                                                       └── is_leaf: Boolean
+--                                                       └── children: List<OrcSchemaField>
+
+
+-- =============================================================================
+-- Domain Overview
+-- =============================================================================
+--
+-- ORC predicate pushdown enables skipping entire stripes (horizontal file
+-- partitions) when their statistics prove no rows can match the filter.
+--
+-- Key insight: ORC files store per-stripe column statistics (min/max/nulls).
+-- By comparing the filter predicate against these statistics, we can determine
+-- if a stripe could possibly contain matching rows. If not, skip it entirely.
+--
+-- This matches Parquet behavior: conservative when statistics are missing.
+--
+-- Terminology mapping (ORC vs Parquet):
+--   ORC Stripe     ≡  Parquet Row Group
+--   ORC Footer     ≡  Parquet FileMetaData
+--   ORC Statistics ≡  Parquet ColumnStatistics
+-- =============================================================================
+
+
+-- =============================================================================
+-- CORE DOMAIN TYPES
+-- =============================================================================
+
+type FieldPath = List<Int>
+-- Nested path into schema, e.g. [1, 0] means field 1's child 0
+
+type FieldRef = String | FieldPath | List<String>
+-- Reference to a field by name, path, or nested name sequence
+
+function is_nested(ref: FieldRef) -> Boolean {
+    -- Returns true if the field reference points to a nested field within a struct/list/map.
+    -- Nested fields have complex column mapping in ORC and may not support statistics pushdown.
+    --
+    -- Examples:
+    --   "x"           -> false (top-level field)
+    --   [0]           -> false (top-level field by index)
+    --   ["a", "b"]    -> true  (field "b" inside struct "a")
+    --   [0, 1]        -> true  (child 1 of field 0)
+
+    match ref:
+        case String: return false  -- Simple name is never nested
+        case FieldPath:
+            return ref.length > 1  -- Path with multiple segments is nested
+        case List<String>:
+            return ref.length > 1  -- Multiple names indicates nested path
+}
+
+type Timestamp = Instant
+
+-- Column types that support statistics-based predicate pushdown.
+-- Other types are handled conservatively (all stripes included).
+--
+-- NOT YET IMPLEMENTED: float32, float64, string, binary
+-- These types will be added in future iterations.
+type SupportedStatisticsType = int32 | int64
+
+-- Comparison predicates that can eliminate stripes using min/max statistics.
+type ComparisonOp = equal | not_equal | less | less_equal | greater | greater_equal
+
+-- Logical combinators for compound predicates.
+type LogicalOp = and | or | not
+
+-- Null-testing predicates.
+type NullOp = is_null | is_valid
+
+
+-- =============================================================================
+-- FLOATING-POINT EDGE CASES (NOT YET IMPLEMENTED)
+-- =============================================================================
+--
+-- NOTE: Float support is not yet implemented. This section documents the
+-- intended behavior for future implementation.
+--
+-- IEEE 754 floating-point values include special values that require careful
+-- handling in statistics-based predicate pushdown:
+--
+-- NaN (Not a Number):
+--   - NaN compares as UNORDERED with all values, including itself
+--   - NaN != NaN is TRUE, NaN == NaN is FALSE
+--   - NaN > x, NaN < x, NaN >= x, NaN <= x are all FALSE
+--   - ORC statistics: NaN values are EXCLUDED from min/max computation
+--   - If a stripe contains only NaN values, min/max will be absent
+--   - Predicate pushdown: If min/max are absent, include the stripe (conservative)
+--
+-- Positive/Negative Infinity:
+--   - +Inf is greater than all finite values
+--   - -Inf is less than all finite values
+--   - ORC statistics: Infinities ARE included in min/max
+--   - min = -Inf means the stripe may contain -Inf
+--   - max = +Inf means the stripe may contain +Inf
+--
+-- Negative Zero (-0.0):
+--   - IEEE 754: -0.0 == +0.0 is TRUE
+--   - ORC treats -0.0 and +0.0 as equal for statistics purposes
+--   - No special handling needed for predicate pushdown
+--
+-- Examples:
+--   Predicate: x > 10.0
+--   Statistics: min=NaN, max=NaN (no valid min/max)
+--   Result: INCLUDE stripe (may contain non-NaN values we don't know about)
+--
+--   Predicate: x > 10.0
+--   Statistics: min=5.0, max=+Inf
+--   Result: INCLUDE stripe (max=+Inf means values above 10 may exist)
+--
+--   Predicate: x < -1000.0
+--   Statistics: min=-Inf, max=20.0
+--   Result: INCLUDE stripe (min=-Inf means values below -1000 may exist)
+--
+--   Predicate: x == NaN
+--   Statistics: min=5.0, max=20.0
+--   Result: INCLUDE stripe (NaN not in statistics, but may exist in data)
+--   Note: Use is_nan(x) function for NaN checks, not equality
+--
+-- Implementation note:
+--   When comparing predicate values against statistics bounds:
+--   - If either value is NaN, comparison returns FALSE (unordered)
+--   - This means predicates involving NaN literals cannot skip stripes
+--   - This is correct conservative behavior
+
+-- Float helper functions (NOT YET IMPLEMENTED)
+-- These will be needed when float support is added.
+-- function is_nan(x: float32 | float64) -> Boolean
+-- function is_finite(x: float32 | float64) -> Boolean
+-- function is_infinite(x: float32 | float64) -> Boolean
+
+
+-- =============================================================================
+-- NULL SEMANTICS IN PREDICATE EVALUATION
+-- =============================================================================
+--
+-- Arrow/ORC uses SQL-style three-valued logic (TRUE, FALSE, UNKNOWN/NULL).
+-- This affects how predicates interact with NULL values and statistics.
+--
+-- Comparison with NULL:
+--   x > 10   where x is NULL  -> UNKNOWN (not TRUE, not FALSE)
+--   x = NULL                  -> UNKNOWN (use is_null() instead)
+--   NULL > NULL               -> UNKNOWN
+--
+-- Logical operators with UNKNOWN:
+--   TRUE  AND UNKNOWN -> UNKNOWN
+--   FALSE AND UNKNOWN -> FALSE
+--   TRUE  OR  UNKNOWN -> TRUE
+--   FALSE OR  UNKNOWN -> UNKNOWN
+--   NOT UNKNOWN       -> UNKNOWN
+--
+-- For predicate pushdown, UNKNOWN is treated conservatively:
+--   - A stripe is INCLUDED if the predicate could be TRUE for any row
+--   - UNKNOWN means "might be TRUE" so the stripe is included
+--   - Only definite FALSE excludes a stripe
+--
+-- Statistics interaction with NULLs:
+--   - min/max statistics exclude NULL values
+--   - A guarantee like "x >= 10 AND x <= 20" only constrains non-NULL values
+--   - To fully describe a column: (x >= min AND x <= max) OR is_null(x)
+--   - The has_null statistic tells us if NULLs exist in the stripe
+--
+-- Example:
+--   Predicate: x > 5
+--   Statistics: min=10, max=20, has_null=true
+--   Guarantee: (x >= 10 AND x <= 20) OR is_null(x)
+--
+--   For non-NULL values: x > 5 is TRUE (since min=10 > 5)
+--   For NULL values: x > 5 is UNKNOWN
+--   Result: Stripe INCLUDED (some rows definitely match, NULLs are UNKNOWN)
+--
+--   Predicate: x < 5
+--   Statistics: min=10, max=20, has_null=true
+--
+--   For non-NULL values: x < 5 is FALSE (since min=10 >= 5)
+--   For NULL values: x < 5 is UNKNOWN
+--   Result: Stripe INCLUDED (NULL rows have UNKNOWN result, might match)
+--
+--   Predicate: x < 5 AND x IS NOT NULL
+--   Statistics: min=10, max=20, has_null=true
+--
+--   For non-NULL values: x < 5 is FALSE
+--   For NULL values: filtered out by IS NOT NULL
+--   Result: Stripe EXCLUDED (no rows can match)
+
+enum TernaryLogic {
+    true_,
+    false_,
+    unknown
+}
+
+function evaluate_with_nulls(predicate: Expression, guarantee: Expression) -> TernaryLogic {
+    -- Evaluate a predicate against a guarantee using three-valued logic.
+    -- Returns:
+    --   true_   : predicate is definitely TRUE for all rows matching the guarantee
+    --   false_  : predicate is definitely FALSE for all rows matching the guarantee
+    --   unknown : predicate may be TRUE, FALSE, or UNKNOWN for different rows
+    --
+    -- This is more precise than is_satisfiable which only distinguishes
+    -- "definitely false" from "possibly true or unknown".
+}
+
+
+-- =============================================================================
+-- EXPRESSION SYSTEM
+-- =============================================================================
+
+entity Expression {
+    -- A compute expression that can be evaluated against record batches
+    -- Used for filters, projections, and statistics guarantees
+
+    kind: literal | field_ref | call
+
+    -- For literals
+    value: Scalar?
+
+    -- For field references
+    field_ref: FieldRef?
+
+    -- For function calls (e.g., and, or, equal, greater)
+    function: String?
+    arguments: List<Expression>?
+
+    -- Computed properties
+    is_satisfiable: Boolean
+    -- true unless the expression is provably always false (e.g., literal(false))
+
+    is_bound: Boolean
+    -- true if all field references are resolved to schema paths with known types
+
+    fields_referenced: Set<FieldRef>
+    -- All fields that appear in this expression
+}
+
+-- Standard expression constructors
+function literal(value: Scalar) -> Expression
+function field_ref(ref: FieldRef) -> Expression
+function and_(left: Expression, right: Expression) -> Expression
+function or_(left: Expression, right: Expression) -> Expression
+function not_(expr: Expression) -> Expression
+function equal(left: Expression, right: Expression) -> Expression
+function not_equal(left: Expression, right: Expression) -> Expression
+function greater(left: Expression, right: Expression) -> Expression
+function greater_equal(left: Expression, right: Expression) -> Expression
+function less(left: Expression, right: Expression) -> Expression
+function less_equal(left: Expression, right: Expression) -> Expression
+function is_null(expr: Expression) -> Expression
+function is_valid(expr: Expression) -> Expression
+function in_(field: Expression, values: List<Scalar>) -> Expression
+
+-- The canonical "no filter" expression
+constant TRUE_EXPRESSION: Expression = literal(true)
+
+-- Expression binding
+function bind(expr: Expression, schema: Schema) -> Expression {
+    -- Bind an expression to a schema, resolving field references to types
+    -- An unbound expression has field_ref by name
+    -- A bound expression has field_ref resolved to path with known type
+}
+
+
+-- =============================================================================
+-- SCHEMA
+-- =============================================================================
+
+entity Schema {
+    fields: List<Field>
+}
+
+entity Scalar {
+    -- A typed scalar value (single element)
+    type: DataType
+    -- value is type-dependent
+}
+
+entity Field {
+    name: String
+    type: DataType
+    nullable: Boolean
+    metadata: Map<String, String>?
+}
+
+entity DataType {
+    -- Abstract representation of Arrow data types
+    id: TypeId
+    children: List<Field>?   -- For nested types like struct, list
+}
+
+enum TypeId {
+    int32, int64, float32, float64,
+    string, binary, boolean,
+    struct_, list, map,
+    timestamp, date, time
+    -- ... other Arrow types
+}
+
+
+-- =============================================================================
+-- External Entities (owned by ORC file format, not this system)
+-- =============================================================================
+
+-- An ORC file containing tabular data organized into stripes
+external entity OrcFile {
+    stripes: List<Stripe>
+    schema: Schema
+    footer: OrcFileFooter
+}
+
+-- ORC file footer containing file-level metadata
+external entity OrcFileFooter {
+    num_rows: Int
+    num_stripes: Int
+    writer_version: String?
+    -- Writer version affects statistics reliability (see statistics validation)
+}
+
+-- A horizontal partition of rows within an ORC file
+external entity Stripe {
+    index: Integer                    -- 0-based position in file
+    num_rows: Integer                 -- number of rows in stripe
+    first_row_id: Integer             -- offset of first row
+    column_statistics: Map<Column, ColumnStatistics>
+}
+
+-- Statistics for a single column within a single stripe
+external entity ColumnStatistics {
+    has_null: Boolean                 -- may contain null values
+    num_values: Integer               -- count of non-null values
+
+    -- Min/max availability
+    has_minimum: Boolean              -- minimum statistic available
+    has_maximum: Boolean              -- maximum statistic available
+
+    -- Typed min/max values (type depends on column type)
+    minimum: Scalar?                  -- minimum value
+    maximum: Scalar?                  -- maximum value
+
+    -- Distinct count (NOT YET IMPLEMENTED)
+    -- Could enable more aggressive IN predicate optimization by detecting
+    -- when all distinct values are known. For example, if distinct_count equals
+    -- the number of values in the IN list and all match, the stripe fully satisfies.
+    --
+    -- Implementation note: liborc doesn't expose a stable distinct-count API
+    -- in all versions we support, so this is left unimplemented.
+    distinct_count: Integer?          -- number of distinct non-null values
+
+    -- For string/binary columns: truncation metadata (NOT YET IMPLEMENTED)
+    -- ORC may truncate long strings in statistics for space efficiency
+    -- These fields will be used when string/binary support is added.
+    is_minimum_truncated: Boolean     -- true if minimum was truncated
+    is_maximum_truncated: Boolean     -- true if maximum was truncated (and incremented)
+
+    -- Statistics reliability flag
+    -- Older ORC writers had bugs in statistics computation
+    is_statistics_deprecated: Boolean -- true if statistics should not be trusted
+}
+
+
+-- =============================================================================
+-- ORC SCHEMA MANIFEST - Mapping Between Arrow and ORC Schemas
+-- =============================================================================
+--
+-- The SchemaManifest maps Arrow schema field paths to ORC physical column indices.
+-- This is required for nested type support (struct, list, map) where a single Arrow
+-- field may span multiple ORC leaf columns.
+--
+-- This mirrors Parquet's SchemaManifest design (file_parquet.cc lines 727-753)
+-- and enables consistent handling of nested types across formats.
+--
+-- =============================================================================
+-- ORC COLUMN INDEXING SCHEME
+-- =============================================================================
+--
+-- ORC uses a depth-first pre-order traversal to assign column IDs in the type tree:
+--
+--   Column 0: Root struct (always present, represents the entire row)
+--   Column 1+: User columns in depth-first order
+--
+-- Example for schema: struct<a:int, b:struct<c:string, d:float>, e:int>
+--
+--   Column 0: root struct
+--   Column 1: a (int)           <- leaf, has statistics
+--   Column 2: b (struct)        <- non-leaf, NO statistics
+--   Column 3: c (string)        <- leaf, has statistics
+--   Column 4: d (float)         <- leaf, has statistics
+--   Column 5: e (int)           <- leaf, has statistics
+--
+-- KEY DIFFERENCES FROM PARQUET:
+--   - ORC: Column 0 is ALWAYS the root struct; user columns start at 1
+--   - Parquet: Columns indexed by schema order; no dedicated root column
+--   - ORC: Non-leaf columns (struct, list, map) have column IDs but NO statistics
+--   - Parquet: Similar - only leaf columns have statistics
+--
+-- STATISTICS AVAILABILITY:
+--   - Only LEAF columns have min/max statistics in ORC stripe footers
+--   - Container columns (struct, list, map) have column IDs but their statistics
+--     are aggregates that don't support predicate pushdown
+--   - The column_index in OrcSchemaField is the ORC type tree index, used to
+--     look up statistics in stripe.column_statistics[column_index]
+--
+-- SOURCE OF COLUMN INDICES:
+--   Column indices are read from the ORC file's type tree in the file footer,
+--   NOT computed by an arbitrary incrementing counter. The ORC writer assigns
+--   indices during file creation; the reader extracts them from metadata.
+
+entity OrcSchemaManifest {
+    -- Mapping between Arrow schema and ORC schema
+    -- Required for nested type column index resolution
+
+    schema_fields: List<OrcSchemaField>
+    -- Top-level fields with recursive structure for nested types
+
+    num_columns: Int
+    -- Total number of ORC leaf columns
+}
+
+entity OrcSchemaField {
+    -- Represents a field in the Arrow schema with its ORC column mapping
+
+    field: Field
+    -- The Arrow field definition
+
+    column_index: Int?
+    -- ORC column index (only for leaf fields)
+    -- null for non-leaf fields (struct, list, map containers)
+
+    is_leaf: Boolean
+    -- true if this field maps directly to an ORC column
+    -- false for container types (struct, list, map)
+
+    children: List<OrcSchemaField>
+    -- Nested fields for struct/list/map types
+    -- Empty for leaf fields
+}
+
+function BuildOrcSchemaManifest(metadata: OrcFileMetadata) -> OrcSchemaManifest {
+    -- Builds mapping from Arrow schema to ORC physical column indices.
+    -- The column indices are extracted from the ORC file's type tree in the footer,
+    -- which assigns indices via depth-first pre-order traversal (column 0 = root struct).
+    --
+    -- Algorithm:
+    --   1. Read the ORC type tree from file metadata (already indexed by ORC writer)
+    --   2. Walk the Arrow schema and ORC type tree in parallel
+    --   3. For each Arrow field, find the corresponding ORC type node
+    --   4. Extract the column_index from the ORC type node:
+    --      - Leaf fields: column_index is used for statistics lookup
+    --      - Container fields: column_index is null (no usable statistics)
+    --   5. Recurse into children for nested types (struct, list, map)
+    --
+    -- IMPORTANT: Column indices are NOT assigned by this function. They are
+    -- read from the ORC file metadata where they were assigned by the ORC writer
+    -- during file creation. This ensures consistency with stripe statistics
+    -- which are also indexed by the same ORC column IDs.
+    --
+    -- Example: For Arrow field "b.c" (nested), this function traverses:
+    --   Arrow schema -> field "b" -> child "c"
+    --   ORC type tree -> column 2 (struct "b") -> column 3 (leaf "c")
+    --   Returns column_index = 3 for statistics lookup
+}
+
+function GetOrcColumnIndex(manifest: OrcSchemaManifest, field_ref: FieldRef) -> Int? {
+    -- Resolve a field reference to its ORC column index using the manifest
+    --
+    -- For top-level fields: Returns the column_index directly
+    -- For nested fields: Traverses the manifest tree to find the leaf column
+    --
+    -- Map-path compatibility:
+    --   Canonical Arrow map leaf paths include the synthetic entries struct:
+    --     map/0/0 -> key, map/0/1 -> value
+    --   For compatibility with existing call sites, implementations may also
+    --   accept shorthand map/{0,1} and resolve them to the same key/value
+    --   leaves.
+    --   In shorthand mode, map/0 is treated as key (leaf), not as a distinct
+    --   entries container node.
+    --
+    -- Returns null if:
+    --   - Field not found in manifest
+    --   - Field is a container type (not a leaf)
+}
+
+
+-- =============================================================================
+-- ORC FILE FRAGMENT - ORC-specific Fragment
+-- =============================================================================
+
+entity OrcFileFragment extends FileFragment {
+    -- A FileFragment with ORC-specific predicate pushdown capabilities
+    --
+    -- KEY INSIGHT: This entity persists across scans. The statistics_cache
+    -- is populated incrementally and reused, making predicate pushdown
+    -- more efficient for repeated queries on the same file.
+
+    stripes: List<Int>?
+    -- Indices of stripes selected by this fragment
+    -- null means all stripes are selected
+
+    metadata: OrcFileMetadata?
+    -- Cached file metadata (lazy-loaded, immutable once set)
+
+    manifest: OrcSchemaManifest?
+    -- Cached schema manifest for Arrow-to-ORC column mapping
+    -- Built from metadata when first needed (lazy-loaded)
+
+    statistics_cache: StripeStatisticsCache?
+    -- Cached stripe statistics, lazily populated
+    -- Each stripe has a combined guarantee expression from all processed fields
+
+    cache_status: uncached | cached | invalidated
+    -- Tracks the state of the statistics cache
+
+    partition_expression: Expression
+    -- An expression that evaluates to true for ALL data in this fragment
+    -- E.g., for a partition "year=2024", this would be: year == 2024
+    -- Inherited from directory structure or Hive-style partitioning
+
+    physical_schema: Schema?
+    -- The actual schema of data in this fragment (lazy-loaded)
+
+    -- Derived properties
+    effective_stripes: List<Int>
+    -- stripes if set, otherwise [0..metadata.num_stripes)
+}
+
+entity OrcFileMetadata {
+    -- ORC file metadata containing stripe information
+
+    num_rows: Int
+    num_stripes: Int
+    schema: Schema
+    writer_version: String?
+    -- Writer version affects statistics reliability
+}
+
+entity StripeMetadata {
+    -- Metadata for a single ORC stripe
+
+    num_rows: Int
+    data_length: Int
+    index_length: Int
+    footer_length: Int
+    columns: List<ColumnStatistics>
+}
+
+
+-- =============================================================================
+-- Core Entities
+-- =============================================================================
+
+-- A field referenced in a predicate, resolved to a physical schema column
+entity PredicateField {
+    field_ref: FieldRef
+    arrow_field_index: Integer        -- 0-based index in Arrow schema
+    orc_column_index: Integer         -- Index in ORC leaf columns (via manifest)
+    data_type: DataType
+    supports_statistics: Boolean      -- true if this field's type supports min/max statistics
+}
+
+-- NOTE ON COLUMN INDICES:
+-- arrow_field_index: Position in the Arrow schema's top-level field list
+-- orc_column_index: Position in ORC's physical column layout (leaf columns only)
+--
+-- For flat schemas these are typically identical, but for nested types they differ:
+--   Arrow schema: [struct<a:int,b:string>, int]  -> arrow indices: [0, 1]
+--   ORC columns:  [struct, int, string, int]     -> orc indices: [0, 1, 2, 3]
+--                 (struct is index 0, a=1, b=2, outer int=3)
+--
+-- The orc_column_index is used for:
+--   1. Looking up column statistics in stripes
+--   2. Tracking which columns have been processed in statistics_complete[]
+--
+-- This mirrors Parquet's PredicateField which has both arrow_field_index and
+-- parquet_column_index (file_parquet.cc lines 708-725).
+
+-- Cached stripe-level statistics expressions for a file fragment
+entity StripeStatisticsCache {
+    -- Per-stripe combined guarantee expressions
+    -- One expression per stripe, initialized to literal(true)
+    -- Tightened (AND'd) as more field statistics are processed
+    stripe_guarantees: List<Expression>
+
+    -- Tracks which fields have been processed
+    -- Prevents redundant statistics loading
+    fields_processed: Set<FieldRef>
+
+    -- Per-column completion status (indexed by column index)
+    -- true if that column's statistics have been processed for all stripes
+    statistics_complete: List<Boolean>
+}
+
+-- Result of filtering stripes against a predicate
+entity StripeFilterResult {
+    selected_indices: List<Integer>   -- 0-based stripe indices to read
+    skipped_count: Integer            -- number of stripes eliminated
+}
+
+-- Extracted bounds for a field from a guarantee expression.
+-- Used by compound predicate rules (OR, IN, NOT) to access statistics.
+entity FieldBounds {
+    min: Scalar?
+    max: Scalar?
+    has_nulls: Boolean
+
+    -- Truncation flags for STRING/BINARY columns (NOT YET IMPLEMENTED)
+    -- These will be used when string/binary support is added.
+    min_truncated: Boolean
+    -- True if min is a truncated prefix (cannot prove lower bound definitively)
+
+    max_truncated: Boolean
+    -- True if max is an incremented truncated prefix (still valid upper bound)
+}
+
+
+-- =============================================================================
+-- Rules
+-- =============================================================================
+
+-- Rule 1: Resolve which predicate fields can participate in pushdown
+rule ResolvePredicateFields {
+    -- Resolves field references in a predicate to PredicateField entities
+    -- using the schema manifest for proper ORC column index resolution.
+    --
+    -- With manifest support, nested fields CAN participate in pushdown
+    -- if they map to leaf columns with statistics support.
+
+    when: ResolveFields(predicate, schema, manifest)
+
+    ensures:
+        for field_ref in predicate.fields_referenced:
+            let field = schema.resolve(field_ref)
+
+            if field = null:
+                skip
+
+            -- Use manifest to resolve ORC column index
+            let orc_col_index = GetOrcColumnIndex(manifest, field_ref)
+
+            -- Skip fields that don't map to a single leaf column
+            -- (e.g., struct containers without direct statistics)
+            if orc_col_index = null:
+                skip
+
+            -- Check if type supports statistics
+            let supports_stats = field.type.id in SupportedStatisticsType
+
+            -- Emit resolved field with both Arrow and ORC indices
+            yield PredicateField(
+                field_ref: field_ref,
+                arrow_field_index: field.index,
+                orc_column_index: orc_col_index,
+                data_type: field.type,
+                supports_statistics: supports_stats
+            )
+}
+
+
+-- Rule 2: Derive a guarantee expression from stripe column statistics
+--
+-- The guarantee captures what we know to be true about a field within a stripe,
+-- based on its statistics. This is used to simplify the predicate.
+rule DeriveFieldGuarantee {
+    when: DeriveGuarantee(stripe, predicate_field)
+
+    -- Use orc_column_index for statistics lookup (not arrow_field_index)
+    -- This correctly handles nested types where indices differ
+    let stats = stripe.column_statistics.get(predicate_field.orc_column_index)
+
+    -- Conservative: if statistics unavailable, no guarantee (include stripe)
+    if stats = null:
+        ensures: null.returned()
+
+    -- Statistics marked as deprecated should not be trusted
+    if stats.is_statistics_deprecated:
+        ensures: null.returned()
+
+    -- Empty stripe check (handled separately by FilterStripesEmptyCheck)
+    if stripe.num_rows = 0:
+        ensures: null.returned()
+
+    -- Sanity check: num_values should not exceed stripe rows
+    if stats.num_values > stripe.num_rows:
+        -- Corrupted statistics, be conservative
+        ensures: null.returned()
+
+    let field_expr = field_ref(predicate_field.field_ref)
+
+    ensures:
+        -- =================================================================
+        -- Case 1: All values are null (num_values counts non-null values)
+        -- =================================================================
+        --
+        -- ORC Statistics Semantics:
+        --   num_values: count of NON-NULL values in the stripe
+        --   has_null: true if ANY null values exist
+        --
+        -- All-null detection: num_values = 0 means zero non-null values exist,
+        -- therefore all values must be null. The stripe.num_rows > 0 guard
+        -- prevents false positives on empty stripes.
+        --
+        -- This differs from Parquet's null_count = num_values check but
+        -- produces identical filtering behavior:
+        --   ORC:     num_values = 0 AND num_rows > 0 -> all null
+        --   Parquet: null_count = num_values         -> all null
+        --
+        -- Both correctly identify when a column has no non-null values.
+        -- =================================================================
+        if stats.num_values = 0 and stripe.num_rows > 0:
+            -- The only thing we know is that all values are NULL
+            -- This allows is_null(x) to be TRUE and is_valid(x) to be FALSE
+            yield is_null(field_expr)
+
+        -- Case 2: Statistics available with min/max
+        else if stats.has_minimum and stats.has_maximum:
+            let min_val = stats.minimum
+            let max_val = stats.maximum
+
+            -- Handle floating-point edge cases (NOT YET IMPLEMENTED)
+            -- When float support is added:
+            -- if predicate_field.data_type.id in {float32, float64}:
+            --     -- If min or max is NaN, statistics are unusable
+            --     if is_nan(min_val) or is_nan(max_val):
+            --         yield null  -- Cannot derive useful guarantee
+
+            -- Validate statistics are sensible
+            if min_val > max_val:
+                -- Corrupted statistics, be conservative
+                yield null
+
+            -- Single value case: equality guarantee
+            if min_val = max_val:
+                let guarantee = equal(field_expr, literal(min_val))
+                if stats.has_null:
+                    yield or_(guarantee, is_null(field_expr))
+                else:
+                    yield guarantee
+
+            -- Range case: bounded guarantee
+            else:
+                let guarantee = and_(
+                    greater_equal(field_expr, literal(min_val)),
+                    less_equal(field_expr, literal(max_val))
+                )
+                if stats.has_null:
+                    yield or_(guarantee, is_null(field_expr))
+                else:
+                    yield guarantee
+
+        -- Case 3: Statistics incomplete - no guarantee
+        else:
+            yield null  -- conservative: cannot derive guarantee
+}
+
+
+-- =============================================================================
+-- EDGE CASE: EMPTY STRIPES
+-- =============================================================================
+--
+-- A stripe with num_rows = 0 is technically valid but unusual.
+-- Handling:
+--   - FilterStripes EXCLUDES empty stripes regardless of predicate
+--   - Empty stripes cannot satisfy any predicate (no rows to match)
+--   - This is an optimization, not a correctness requirement
+
+rule FilterStripesEmptyCheck {
+    -- Empty stripes are always excluded from scan.
+    -- This check happens before statistics evaluation.
+
+    when: CheckStripeEmpty(stripe)
+
+    if stripe.num_rows = 0:
+        ensures: false.returned()  -- Exclude: no rows to match
+    else:
+        ensures: true.returned()   -- Proceed with statistics-based filtering
+}
+
+
+-- =============================================================================
+-- STRING/BINARY TRUNCATION HANDLING (NOT YET IMPLEMENTED)
+-- =============================================================================
+--
+-- NOTE: String/binary support is not yet implemented. This section documents
+-- the intended behavior for future implementation.
+--
+-- ORC allows truncating min/max statistics for STRING/BINARY columns
+-- to save space in the footer. The truncation is conservative:
+--
+-- Truncated MIN:
+--   - The stored min is a PREFIX of the actual minimum value
+--   - stored_min <= actual_min (lexicographically)
+--   - For predicate x >= 'abc', if stored_min = 'ab' (truncated from 'abc...'),
+--     we cannot skip even if 'ab' < 'abc' because actual_min might be >= 'abc'
+--   - CONSERVATIVE: Truncated min means we CANNOT prove x >= value is FALSE
+--
+-- Truncated MAX:
+--   - The stored max is the prefix with last byte incremented (if possible)
+--   - If prefix is 'ab', truncated max might be 'ac' (increment 'b' to 'c')
+--   - stored_max >= actual_max
+--   - For predicate x <= 'abc', truncated max is still useful
+--   - CONSERVATIVE: Truncated max is an upper bound, still valid for <= checks
+--
+-- Detection:
+--   - is_minimum_truncated flag indicates min truncation occurred
+--   - is_maximum_truncated flag indicates max truncation occurred
+
+rule SimplifyWithTruncatedStatistics {
+    -- Handle STRING/BINARY predicates when statistics may be truncated.
+    -- NOTE: NOT YET IMPLEMENTED - string/binary support pending.
+
+    when: SimplifyWithGuarantee(comparison(field_ref(ref), literal(value)), guarantee)
+    where: value.type.id in {string, binary}  -- Currently not matched (types unsupported)
+
+    let field_bounds = ExtractFieldBounds(ref, guarantee)
+
+    if field_bounds = null:
+        ensures: comparison(field_ref(ref), literal(value)).returned()
+
+    -- Check for truncation
+    if field_bounds.min_truncated:
+        -- Cannot use min for lower-bound comparisons
+        if comparison in {greater, greater_equal}:
+            -- Cannot prove FALSE; return original predicate
+            ensures: comparison(field_ref(ref), literal(value)).returned()
+
+    if field_bounds.max_truncated:
+        -- Max is an upper bound, still useful for upper-bound comparisons
+        -- But cannot prove TRUE from truncated max
+        pass  -- Normal handling applies
+
+    -- Proceed with normal simplification using possibly-truncated bounds
+}
+
+
+-- =============================================================================
+-- ROW INDEX STATISTICS (NOT YET IMPLEMENTED - FUTURE OPPORTUNITY)
+-- =============================================================================
+--
+-- NOTE: Row index statistics are not currently used for predicate pushdown.
+-- This section documents the opportunity for future implementation.
+--
+-- ORC supports finer-grained statistics at the row index level, typically
+-- every 10,000 rows (configurable via orc.row.index.stride). These statistics
+-- are stored in the stripe's index streams and provide sub-stripe filtering.
+--
+-- Current implementation:
+--   - GetRowIndexStride() exists in the ORC adapter but is unused for pushdown
+--   - Stripe-level statistics provide coarse-grained filtering only
+--
+-- Future opportunity:
+--   - Read row index statistics for even more aggressive filtering
+--   - Skip row groups within a stripe when statistics prove no matches
+--   - Particularly beneficial for large stripes with heterogeneous data
+--
+-- Trade-offs:
+--   - Additional I/O to read index streams (though typically small)
+--   - More complex filtering logic with two-level statistics
+--   - Diminishing returns if stripe-level filtering is already effective
+--
+-- This mirrors Parquet's page-level statistics (column index) which provides
+-- similar sub-row-group filtering capabilities.
+
+
+-- =============================================================================
+-- COMPOUND PREDICATE HANDLING (OR, IN, NOT, !=)
+-- =============================================================================
+
+rule SimplifyOrPredicate {
+    -- Simplify OR predicates against statistics guarantees.
+    --
+    -- Key insight: OR is satisfiable if ANY branch is satisfiable.
+    -- We can only skip a stripe if ALL branches are unsatisfiable.
+    --
+    -- Partial statistics handling:
+    --   If some fields in the OR have statistics and others don't,
+    --   the branches without statistics are treated as "possibly true".
+
+    when: SimplifyWithGuarantee(or_(left, right), guarantee)
+
+    let left_simplified = SimplifyWithGuarantee(left, guarantee)
+    let right_simplified = SimplifyWithGuarantee(right, guarantee)
+
+    -- If either branch is definitely TRUE, the OR is TRUE
+    if left_simplified = literal(true) or right_simplified = literal(true):
+        ensures: literal(true).returned()
+
+    -- If both branches are definitely FALSE, the OR is FALSE
+    if left_simplified = literal(false) and right_simplified = literal(false):
+        ensures: literal(false).returned()
+
+    -- If one branch is FALSE, return the other
+    if left_simplified = literal(false):
+        ensures: right_simplified.returned()
+    if right_simplified = literal(false):
+        ensures: left_simplified.returned()
+
+    -- Otherwise, return simplified OR
+    ensures: or_(left_simplified, right_simplified).returned()
+}
+
+rule SimplifyAndPredicate {
+    -- Simplify AND predicates against statistics guarantees.
+    --
+    -- Key insight: AND is satisfiable only if BOTH branches are satisfiable.
+    -- We can skip a stripe if EITHER branch is unsatisfiable.
+
+    when: SimplifyWithGuarantee(and_(left, right), guarantee)
+
+    let left_simplified = SimplifyWithGuarantee(left, guarantee)
+    let right_simplified = SimplifyWithGuarantee(right, guarantee)
+
+    -- If either branch is definitely FALSE, the AND is FALSE
+    if left_simplified = literal(false) or right_simplified = literal(false):
+        ensures: literal(false).returned()
+
+    -- If both branches are definitely TRUE, the AND is TRUE
+    if left_simplified = literal(true) and right_simplified = literal(true):
+        ensures: literal(true).returned()
+
+    -- If one branch is TRUE, return the other
+    if left_simplified = literal(true):
+        ensures: right_simplified.returned()
+    if right_simplified = literal(true):
+        ensures: left_simplified.returned()
+
+    -- Otherwise, return simplified AND
+    ensures: and_(left_simplified, right_simplified).returned()
+}
+
+rule SimplifyNotPredicate {
+    -- Simplify NOT predicates against statistics guarantees.
+    --
+    -- NOT(x > 10) is equivalent to x <= 10 OR x IS NULL (in SQL semantics)
+    -- For pushdown purposes, we use: NOT(definitely_true) = definitely_false
+    --
+    -- NOT inverts the satisfiability:
+    --   NOT(literal(true))  -> literal(false)
+    --   NOT(literal(false)) -> literal(true)
+    --   NOT(unknown)        -> unknown (conservative)
+
+    when: SimplifyWithGuarantee(not_(expr), guarantee)
+
+    let inner_simplified = SimplifyWithGuarantee(expr, guarantee)
+
+    if inner_simplified = literal(true):
+        ensures: literal(false).returned()
+    if inner_simplified = literal(false):
+        ensures: literal(true).returned()
+
+    -- Cannot simplify further; return NOT of simplified inner
+    ensures: not_(inner_simplified).returned()
+}
+
+rule SimplifyNotEqualPredicate {
+    -- Simplify NOT EQUAL (!=) predicates against statistics guarantees.
+    --
+    -- x != value can skip a stripe when:
+    --   - min = max = value (all non-null values equal the excluded value)
+    --
+    -- If NULLs are present, x != value evaluates to UNKNOWN for NULL rows,
+    -- never TRUE. Therefore NULLs do not prevent exclusion in this case.
+    --
+    -- Example:
+    --   Predicate: x != 10
+    --   Statistics: min=10, max=10, has_null=false
+    --   Result: literal(false) -- all values are exactly 10, none satisfy != 10
+    --
+    --   Predicate: x != 10
+    --   Statistics: min=10, max=10, has_null=true
+    --   Result: literal(false) -- rows are either 10 (FALSE) or NULL (UNKNOWN)
+
+    when: SimplifyWithGuarantee(not_equal(field_ref(ref), literal(value)), guarantee)
+
+    -- Extract statistics bounds from guarantee if available
+    let field_bounds = ExtractFieldBounds(ref, guarantee)
+
+    if field_bounds = null:
+        -- No statistics for this field; cannot simplify
+        ensures: not_equal(field_ref(ref), literal(value)).returned()
+
+    if field_bounds.min = field_bounds.max = value:
+        -- All non-null values equal the excluded value.
+        -- NULL rows evaluate to UNKNOWN for !=, so no row can be TRUE.
+        ensures: literal(false).returned()
+
+    if value < field_bounds.min or value > field_bounds.max:
+        if field_bounds.has_nulls = false:
+            -- Value is outside the range, so != is always TRUE
+            ensures: literal(true).returned()
+
+    -- Cannot prove true or false
+    ensures: not_equal(field_ref(ref), literal(value)).returned()
+}
+
+rule SimplifyInPredicate {
+    -- Simplify IN predicates against statistics guarantees.
+    --
+    -- x IN (v1, v2, v3) is equivalent to x = v1 OR x = v2 OR x = v3
+    --
+    -- Optimization: Use min/max range intersection.
+    --   If no values in the IN list fall within [min, max], skip the stripe.
+    --
+    -- Example:
+    --   Predicate: x IN (1, 2, 3)
+    --   Statistics: min=10, max=20
+    --   Result: literal(false) -- no IN values are in [10, 20]
+    --
+    --   Predicate: x IN (1, 15, 100)
+    --   Statistics: min=10, max=20
+    --   Result: x IN (1, 15, 100) -- only 15 is in range, but keep full predicate
+    --           (post-scan filtering will handle correctness)
+
+    when: SimplifyWithGuarantee(in_(field_ref(ref), values), guarantee)
+
+    let field_bounds = ExtractFieldBounds(ref, guarantee)
+
+    if field_bounds = null:
+        -- No statistics; cannot simplify
+        ensures: in_(field_ref(ref), values).returned()
+
+    -- Filter values to those within [min, max]
+    let values_in_range = [
+        v for v in values
+        if v >= field_bounds.min and v <= field_bounds.max
+    ]
+
+    if values_in_range.empty:
+        if field_bounds.has_nulls = false:
+            -- No IN values overlap with statistics range, no NULLs
+            ensures: literal(false).returned()
+        else:
+            -- NULLs exist; IN with NULL handling is complex, be conservative
+            ensures: in_(field_ref(ref), values).returned()
+
+    -- Some values are in range; return original predicate
+    -- Post-scan filtering will handle correctness
+    ensures: in_(field_ref(ref), values).returned()
+}
+
+
+-- =============================================================================
+-- Rule 3: Test a single stripe against a predicate
+--
+-- Uses the stripe's statistics to simplify the predicate. If simplified
+-- predicate is unsatisfiable, the stripe can be skipped.
+-- =============================================================================
+
+rule TestStripe {
+    when: TestStripe(stripe, predicate, predicate_fields, cache)
+
+    -- Skip empty stripes immediately
+    if not CheckStripeEmpty(stripe):
+        ensures: literal(false).returned()
+
+    -- Gather all field guarantees for this stripe
+    let stripe_guarantee =
+        for field in predicate_fields:
+            if field.supports_statistics:
+                let field_guarantee = DeriveFieldGuarantee(stripe, field)
+                if field_guarantee != null:
+                    yield field_guarantee
+        combine with: and_
+
+    -- If no guarantees could be derived, return original predicate (conservative)
+    if stripe_guarantee = null:
+        ensures: predicate.returned()
+
+    -- Simplify predicate using stripe guarantee
+    let simplified = SimplifyWithGuarantee(predicate, stripe_guarantee)
+
+    ensures: simplified.returned()
+}
+
+
+-- =============================================================================
+-- EXPRESSION BINDING CONTRACT
+-- =============================================================================
+--
+-- Predicates passed to FilterStripes/TestStripes may be unbound.
+-- TestStripes handles binding defensively to ensure correctness.
+--
+-- Preferred approach: Scanner binds expressions before passing to fragments.
+-- Defensive approach: TestStripes checks and binds if needed.
+--
+-- This matches the defensive pattern used in the actual implementation
+-- (cpp/src/arrow/dataset/file_orc.cc line 514).
+--
+-- Invariant: Binding is idempotent - re-binding a bound expression is safe.
+--
+-- The binding process:
+--   1. Resolve field names to schema paths
+--   2. Infer types for field references
+--   3. Validate type compatibility for operations
+--
+-- Example:
+--   Unbound: field_ref("x") > 10
+--   Bound:   field_ref([0], type=int64) > 10  (where "x" is at index 0)
+-- =============================================================================
+
+
+-- =============================================================================
+-- Rule 4a: Test stripes - returns per-stripe simplified expressions
+--
+-- This is the core statistics evaluation logic, separated from filtering
+-- to enable reuse by TryCountRows and other optimization paths.
+--
+-- Returns: List of simplified expressions, one per effective stripe.
+--          Each expression represents the predicate after applying stripe statistics.
+--          literal(false) means the stripe can be skipped.
+--          literal(true) means all rows in stripe match.
+--          Other expressions mean the stripe needs post-scan filtering.
+--
+-- This mirrors Parquet's TestRowGroups (file_parquet.cc lines 918-1004).
+-- =============================================================================
+
+rule TestStripes {
+    when: TestStripes(orc_fragment, predicate)
+
+    requires: orc_fragment.metadata != null
+    requires: orc_fragment.statistics_cache != null
+    requires: orc_fragment.manifest != null
+
+    let cache = orc_fragment.statistics_cache
+
+    -- Bind predicate if needed (defensive binding for edge cases)
+    let bound_predicate =
+        if predicate.is_bound:
+            predicate
+        else:
+            bind(predicate, orc_fragment.physical_schema)
+
+    -- Simplify with partition guarantees first
+    let simplified_predicate = SimplifyWithGuarantee(bound_predicate, orc_fragment.partition_expression)
+
+    -- Early exit: predicate unsatisfiable at partition level
+    if not simplified_predicate.is_satisfiable:
+        ensures: EmptyList.returned()
+
+    -- Resolve predicate fields using manifest for proper column mapping
+    let predicate_fields = ResolvePredicateFields(
+        simplified_predicate,
+        orc_fragment.physical_schema,
+        orc_fragment.manifest
+    )
+
+    -- Find fields not yet in cache (incremental population)
+    let uncached_fields = [
+        pf for pf in predicate_fields
+        if pf.field_ref not in cache.fields_processed
+        if pf.supports_statistics
+    ]
+
+    -- Load statistics for uncached fields into cache
+    for pf in uncached_fields:
+        for (i, stripe_idx) in orc_fragment.effective_stripes.enumerate():
+            let stripe = orc_fragment.metadata.stripes[stripe_idx]
+            let guarantee = DeriveFieldGuarantee(stripe, pf)
+
+            if guarantee != null:
+                cache.stripe_guarantees[i] = FoldingAnd(
+                    cache.stripe_guarantees[i],
+                    guarantee
+                )
+
+        cache.fields_processed.add(pf.field_ref)
+        -- Use orc_column_index for statistics_complete (not arrow_field_index)
+        cache.statistics_complete[pf.orc_column_index] = true
+
+    -- Return per-stripe simplified expressions
+    ensures: List<Expression>.returned(
+        for (i, _) in orc_fragment.effective_stripes.enumerate():
+            SimplifyWithGuarantee(simplified_predicate, cache.stripe_guarantees[i])
+    )
+}
+
+
+-- =============================================================================
+-- Rule 4b: Filter stripes - the main entry point
+--
+-- Given a predicate, determine which stripes may contain matching rows.
+-- Uses TestStripes for the core statistics evaluation.
+-- =============================================================================
+
+rule FilterStripes {
+    when: FilterStripes(orc_fragment, predicate)
+
+    -- Ensure metadata, manifest, and statistics cache are loaded
+    EnsureFileMetadataCached(orc_fragment)
+    EnsureManifestCached(orc_fragment)
+    EnsureStatisticsCached(orc_fragment)
+
+    -- Get per-stripe simplified expressions
+    let stripe_expressions = TestStripes(orc_fragment, predicate)
+
+    -- Early exit: if empty (partition-level unsatisfiable)
+    if stripe_expressions.empty:
+        ensures: StripeFilterResult(
+            selected_indices: [],
+            skipped_count: orc_fragment.effective_stripes.count
+        ).returned()
+
+    -- Select stripes where predicate is satisfiable
+    let selected = []
+    for (i, stripe_idx) in orc_fragment.effective_stripes.enumerate():
+        let stripe = orc_fragment.metadata.stripes[stripe_idx]
+
+        -- Skip empty stripes
+        if stripe.num_rows = 0:
+            continue
+
+        -- Include stripe if predicate is satisfiable
+        if stripe_expressions[i].is_satisfiable:
+            selected.append(stripe_idx)
+
+    ensures: StripeFilterResult(
+        selected_indices: selected,
+        skipped_count: orc_fragment.effective_stripes.count - selected.count
+    ).returned()
+}
+
+
+-- =============================================================================
+-- Rule 4c: TryCountRows - count rows from metadata when possible
+--
+-- Optimization: If the predicate can be fully evaluated using stripe statistics
+-- (all stripes simplify to literal(true) or literal(false)), we can count
+-- rows directly from metadata without reading any actual data.
+--
+-- This mirrors Parquet's ParquetTryCountRows (file_parquet.cc lines 1299-1330).
+-- =============================================================================
+
+rule OrcTryCountRows {
+    when: TryCountRows(orc_fragment, predicate)
+
+    -- Ensure metadata and statistics are cached
+    EnsureFileMetadataCached(orc_fragment)
+    EnsureManifestCached(orc_fragment)
+    EnsureStatisticsCached(orc_fragment)
+
+    -- Fast path: no field references means count all rows
+    if not ExpressionHasFieldRefs(predicate):
+        -- Predicate is just literal(true) or similar
+        if predicate.is_satisfiable:
+            ensures: orc_fragment.metadata.num_rows.returned()
+        else:
+            ensures: 0.returned()
+
+    -- Get per-stripe simplified expressions
+    let stripe_expressions = TestStripes(orc_fragment, predicate)
+
+    -- If partition-level unsatisfiable, count is 0
+    if stripe_expressions.empty:
+        ensures: 0.returned()
+
+    -- Try to count from metadata alone
+    var total_rows = 0
+    for (i, stripe_idx) in orc_fragment.effective_stripes.enumerate():
+        let stripe = orc_fragment.metadata.stripes[stripe_idx]
+        let expr = stripe_expressions[i]
+
+        -- Skip stripes that are provably empty
+        if not expr.is_satisfiable:
+            continue
+
+        -- If expression is not literal(true), we can't count from metadata
+        -- because some rows in the stripe might not match
+        if expr != literal(true):
+            -- Cannot count from metadata alone; caller must do full scan
+            ensures: null.returned()
+
+        -- This stripe fully matches; add its row count
+        total_rows += stripe.num_rows
+
+    -- All stripes were either fully matched or fully excluded
+    ensures: total_rows.returned()
+}
+
+function ExpressionHasFieldRefs(expr: Expression) -> Boolean {
+    -- Returns true if the expression references any fields
+    -- (as opposed to being purely literal-based)
+    return expr.fields_referenced.count > 0
+}
+
+
+-- =============================================================================
+-- Invariants
+-- =============================================================================
+
+-- Invariant: Predicate pushdown is conservative (never loses valid rows)
+--
+-- Any row that matches the predicate MUST be in a stripe that is selected.
+-- Equivalently: we may include extra stripes, but never exclude required ones.
+invariant ConservativeFiltering {
+    for orc_fragment, predicate:
+        let result = FilterStripes(orc_fragment, predicate)
+        for row in orc_fragment.all_rows:
+            if predicate.matches(row):
+                row.stripe.index in result.selected_indices
+}
+
+-- Invariant: Missing statistics always include the stripe
+invariant MissingStatisticsInclude {
+    for orc_fragment, predicate:
+        let result = FilterStripes(orc_fragment, predicate)
+        for stripe in orc_fragment.effective_stripes:
+            -- If any field in predicate lacks statistics for this stripe
+            let has_all_stats = all(
+                for field in predicate.fields_referenced:
+                    stripe.column_statistics.get(field.index) != null
+                    and stripe.column_statistics.get(field.index).has_minimum
+                    and stripe.column_statistics.get(field.index).has_maximum
+            )
+            -- If statistics are incomplete, stripe must be included
+            -- (unless excluded by other fully-statistical fields)
+            if not has_all_stats:
+                -- The stripe MIGHT be included; we cannot prove exclusion
+                -- without complete statistics for all predicate fields
+                true  -- This is a necessary condition, not sufficient
+}
+
+-- Invariant: Unsupported field types do not cause exclusion
+--
+-- If a predicate references a field whose type does not support statistics
+-- (e.g., boolean, nested types), that field cannot contribute to stripe exclusion.
+-- The stripe must be included unless other supported fields prove exclusion.
+invariant UnsupportedTypesConservative {
+    for orc_fragment, predicate:
+        let result = FilterStripes(orc_fragment, predicate)
+        let unsupported_fields = [
+            f for f in predicate.fields_referenced
+            if f.type.id not in SupportedStatisticsType
+        ]
+        -- If predicate ONLY references unsupported fields, all stripes included
+        if unsupported_fields.count = predicate.fields_referenced.count:
+            result.selected_indices = orc_fragment.effective_stripes
+}
+
+-- Invariant: Empty stripes are never included
+invariant EmptyStripesExcluded {
+    for orc_fragment, predicate:
+        let result = FilterStripes(orc_fragment, predicate)
+        for stripe_idx in result.selected_indices:
+            orc_fragment.metadata.stripes[stripe_idx].num_rows > 0
+}
+
+-- Invariant: Deprecated statistics are not trusted
+invariant DeprecatedStatisticsIgnored {
+    for orc_fragment, predicate:
+        let result = FilterStripes(orc_fragment, predicate)
+        for stripe in orc_fragment.effective_stripes:
+            for field in predicate.fields_referenced:
+                let stats = stripe.column_statistics.get(field.index)
+                -- If statistics are deprecated, they cannot cause exclusion
+                if stats != null and stats.is_statistics_deprecated:
+                    -- This field's statistics do not contribute to exclusion
+                    true
+}
+
+-- Invariant: Metadata and manifest are immutable once populated
+--
+-- Once OrcFileMetadata or OrcSchemaManifest is set on a fragment, it never changes.
+-- This allows safe sharing across subset fragments without defensive copies.
+-- The statistics_cache is mutable (accumulates field statistics) but metadata/manifest are not.
+invariant MetadataCacheImmutability {
+    -- Once metadata is populated, it never changes.
+    -- This allows safe sharing across subset fragments.
+
+    if fragment.metadata != null:
+        fragment.metadata = constant
+
+    if fragment.manifest != null:
+        fragment.manifest = constant
+}
+
+-- Invariant: Statistics guarantees monotonically tighten
+--
+-- Each FoldingAnd operation can only narrow the possible value space, never widen it.
+-- This ensures that adding more field statistics never causes a stripe to be
+-- incorrectly excluded that was previously included.
+invariant StatisticsMonotonicity {
+    -- Statistics guarantees can only become more restrictive.
+    -- Each FoldingAnd operation narrows the possible value space.
+
+    for stripe_idx in fragment.effective_stripes:
+        after_field_added(cache.stripe_guarantees[stripe_idx]) implies
+            before_field_added(cache.stripe_guarantees[stripe_idx])
+}
+
+
+-- =============================================================================
+-- CONCURRENT CACHE UPDATE SYNCHRONIZATION
+-- =============================================================================
+--
+-- When multiple threads scan the same OrcFileFragment concurrently,
+-- they may attempt to update the statistics_cache simultaneously.
+--
+-- Synchronization Mechanism:
+--   The statistics_cache is protected by physical_schema_mutex_.
+--   All reads and writes to the cache must acquire this lock.
+--
+-- Critical Sections:
+--   1. EnsureFileMetadataCached: Lock while checking/setting metadata
+--   2. EnsureManifestCached: Lock while checking/setting manifest
+--   3. EnsureStatisticsCached: Lock while initializing cache
+--   4. TestStripes: Lock while reading/updating fields_processed and stripe_guarantees
+--
+-- Concurrent Update Protocol:
+--   Thread A                          Thread B
+--   ---------                         ---------
+--   acquire(lock)
+--   check: field in fields_processed?
+--   (no) -> compute statistics
+--   update stripe_guarantees
+--   add field to fields_processed
+--   release(lock)
+--                                     acquire(lock)
+--                                     check: field in fields_processed?
+--                                     (yes) -> skip, use cached result
+--                                     release(lock)
+--
+-- Idempotency Guarantee:
+--   If both threads compute statistics for the same field before either
+--   checks fields_processed, they will compute identical guarantees.
+--   Double-computation is wasteful but not incorrect.
+--
+-- Invariant: All statistics cache mutations are serialized via physical_schema_mutex_.
+--
+-- Note: The actual implementation (cpp/src/arrow/dataset/file_orc.cc) uses
+-- physical_schema_mutex_ at lines 485, 534, 618 for this synchronization.
+-- This matches Parquet's thread safety model (file_parquet.cc lines 2139-2199).
+
+entity CacheLock {
+    -- Mutex protecting the statistics cache of an OrcFileFragment
+    fragment: OrcFileFragment
+}
+
+function acquire(lock: CacheLock) -> void {
+    -- Acquire exclusive access to the fragment's cache
+}
+
+function release(lock: CacheLock) -> void {
+    -- Release exclusive access to the fragment's cache
+}
+
+
+-- =============================================================================
+-- Cache Management Rules
+-- =============================================================================
+
+-- Statistics are lazily computed and cached per-field per-fragment.
+-- Once a field's statistics are loaded across all stripes, it is marked complete.
+-- Subsequent predicates using that field reuse cached guarantees.
+
+rule EnsureFileMetadataCached {
+    -- Load file metadata if not already cached.
+    -- This is required before accessing stripe statistics.
+
+    when: EnsureFileMetadataCached(orc_fragment)
+
+    requires: orc_fragment.cache_status != invalidated
+
+    if orc_fragment.metadata = null:
+        let metadata = ReadOrcFileMetadata(orc_fragment.source)
+        ensures: orc_fragment.metadata = metadata
+        ensures: orc_fragment.physical_schema = metadata.schema
+}
+
+rule EnsureStatisticsCached {
+    -- Initialize the statistics cache if not already done.
+    -- Safe to call multiple times (idempotent).
+
+    when: EnsureStatisticsCached(orc_fragment)
+
+    requires: orc_fragment.cache_status != invalidated
+    requires: orc_fragment.metadata != null
+
+    if orc_fragment.statistics_cache = null:
+        let num_stripes = orc_fragment.effective_stripes.length
+        let num_columns = orc_fragment.physical_schema.fields.length
+
+        ensures: orc_fragment.statistics_cache = StripeStatisticsCache(
+            stripe_guarantees: [literal(true) for _ in 0..num_stripes],
+            fields_processed: {},
+            statistics_complete: [false for _ in 0..num_columns]
+        )
+        ensures: orc_fragment.cache_status = cached
+}
+
+rule EnsureManifestCached {
+    -- Build and cache the schema manifest if not already done.
+    -- The manifest maps Arrow schema fields to ORC column indices.
+
+    when: EnsureManifestCached(orc_fragment)
+
+    requires: orc_fragment.metadata != null
+
+    if orc_fragment.manifest = null:
+        let manifest = BuildOrcSchemaManifest(orc_fragment.metadata)
+        ensures: orc_fragment.manifest = manifest
+}
+
+rule ClearCachedMetadata {
+    -- Invalidate all cached metadata.
+    -- Next FilterStripes call will rebuild from scratch.
+
+    when: ClearCachedMetadata(orc_fragment)
+
+    ensures: orc_fragment.statistics_cache = null
+    ensures: orc_fragment.manifest = null
+    ensures: orc_fragment.metadata = null
+    ensures: orc_fragment.cache_status = uncached
+}
+
+
+-- =============================================================================
+-- Expression Simplification
+-- =============================================================================
+
+function SimplifyWithGuarantee(predicate: Expression, guarantee: Expression) -> Expression {
+    -- Simplify a predicate given a guarantee expression
+    --
+    -- The guarantee represents facts known to be true about the data.
+    -- If the predicate can be proven true/false given the guarantee,
+    -- it is replaced with literal(true) or literal(false).
+    --
+    -- Example:
+    --   predicate: x > 10
+    --   guarantee: x >= 15 AND x <= 20
+    --   result: literal(true)  -- because min(x) > 10
+    --
+    --   predicate: x < 5
+    --   guarantee: x >= 15 AND x <= 20
+    --   result: literal(false) -- because max(x) >= 5
+
+    -- Implementation uses algebraic simplification rules
+    -- Returns simplified expression
+}
+
+function FoldingAnd(left: Expression, right: Expression) -> Expression {
+    -- Combine two expressions with AND, optimizing for literal(true)
+
+    if left = literal(true):
+        return right
+    else:
+        return and_(left, right)
+}
+
+function ExtractFieldBounds(ref: FieldRef, guarantee: Expression) -> FieldBounds? {
+    -- Extract min/max bounds for a field from a guarantee expression.
+    -- Returns null if the field is not constrained by the guarantee.
+    --
+    -- Parses guarantee expressions of the form:
+    --   (field >= min AND field <= max) OR is_null(field)
+    --
+    -- This is the inverse of DeriveFieldGuarantee.
+}
+
+
+-- =============================================================================
+-- ORC Format Scan - Integration with Dataset API
+-- =============================================================================
+
+rule OrcFileFormatScanBatchesAsync {
+    -- Scan an ORC fragment, applying predicate pushdown
+    -- This is the main entry point showing the complete flow
+
+    when: ScanBatchesAsync(format: OrcFileFormat, scan_options, orc_fragment)
+
+    -- OPTIMIZATION: Pre-filter stripes if metadata is already cached
+    -- This avoids opening the file at all if all stripes are excluded
+    var stripes: List<Int>
+    var pre_filtered = false
+
+    if orc_fragment.metadata != null:
+        let filter_result = FilterStripes(orc_fragment, scan_options.filter)
+        stripes = filter_result.selected_indices
+        pre_filtered = true
+
+        -- Early exit: if no stripes match, return empty generator
+        if stripes.empty:
+            ensures: EmptyRecordBatchGenerator.returned()
+
+    -- Open the ORC file reader (the actual I/O cost)
+    let reader = OpenOrcReader(orc_fragment.source, scan_options)
+
+    -- Ensure metadata and statistics cache are loaded
+    EnsureFileMetadataCached(orc_fragment)
+    EnsureStatisticsCached(orc_fragment)
+
+    -- Filter stripes (if not already done)
+    if not pre_filtered:
+        let filter_result = FilterStripes(orc_fragment, scan_options.filter)
+        stripes = filter_result.selected_indices
+
+        -- Early exit: if no stripes match, return empty generator
+        if stripes.empty:
+            ensures: EmptyRecordBatchGenerator.returned()
+
+    -- Compute column projection from materialized fields
+    let column_projection = InferColumnProjection(reader, scan_options)
+
+    -- Create the record batch generator
+    let generator = reader.GetRecordBatchGenerator(
+        stripes: stripes,
+        column_projection: column_projection,
+        batch_size: scan_options.batch_size
+    )
+
+    -- SLICING: Enforce maximum batch size via SlicingGenerator
+    -- This ensures batches respect batch_size even if the ORC reader
+    -- produces larger batches (e.g., when a stripe has more rows than batch_size).
+    -- This mirrors Parquet's use of SlicingGenerator (file_parquet.cc line 1442).
+    let sliced_generator = SlicingGenerator(generator, scan_options.batch_size)
+
+    -- Apply readahead if enabled
+    if scan_options.batch_readahead > 0:
+        ensures: ReadaheadGenerator.returned(sliced_generator, scan_options.batch_readahead)
+    else:
+        ensures: sliced_generator.returned()
+}
+
+rule OrcSubset {
+    -- Create a new fragment selecting a subset of stripes.
+    --
+    -- CACHE SHARING POLICY:
+    -- The subset fragment shares the IMMUTABLE metadata and manifest but gets
+    -- a FRESH statistics_cache.
+    --
+    -- Rationale:
+    --   - metadata (OrcFileMetadata) is immutable and safe to share
+    --   - manifest (OrcSchemaManifest) is immutable and safe to share
+    --   - statistics_cache contains per-stripe guarantees indexed by position
+    --   - Subset fragments have different stripes lists, so cache indices don't align
+    --   - A fresh cache is simpler and avoids index translation complexity
+
+    when: Subset(orc_fragment, predicate)
+
+    let filter_result = FilterStripes(orc_fragment, predicate)
+
+    ensures: OrcFileFragment.created(
+        source: orc_fragment.source,
+        format: orc_fragment.format,
+        partition_expression: orc_fragment.partition_expression,
+        physical_schema: orc_fragment.physical_schema,
+        stripes: filter_result.selected_indices,
+        metadata: orc_fragment.metadata,       -- SHARED: immutable file metadata
+        manifest: orc_fragment.manifest,       -- SHARED: immutable schema manifest
+        statistics_cache: null,                -- FRESH: new cache for subset indices
+        cache_status: uncached                 -- Will be initialized on first scan
+    )
+}
+
+rule OrcSplitByStripe {
+    -- Split a fragment into multiple fragments, one per stripe
+
+    when: SplitByStripe(orc_fragment, predicate)
+
+    let filter_result = FilterStripes(orc_fragment, predicate)
+
+    ensures: List<OrcFileFragment>.returned(
+        for stripe_idx in filter_result.selected_indices:
+            OrcFileFragment.created(
+                source: orc_fragment.source,
+                format: orc_fragment.format,
+                partition_expression: orc_fragment.partition_expression,
+                physical_schema: orc_fragment.physical_schema,
+                stripes: [stripe_idx],
+                metadata: orc_fragment.metadata,
+                manifest: orc_fragment.manifest  -- SHARED: immutable schema manifest
+            )
+    )
+}
+
+
+-- =============================================================================
+-- Column Projection Inference
+-- =============================================================================
+
+rule InferColumnProjection {
+    -- Compute the ORC column indices needed for the scan
+    -- Based on the fields referenced in filter and projection
+
+    when: InferColumnProjection(reader, scan_options)
+
+    let field_refs = MaterializedFields(scan_options)
+
+    var column_indices: List<Int> = []
+
+    for field_ref in field_refs:
+        -- Look up the field in the schema
+        let field = reader.schema.resolve(field_ref)
+
+        if field != null:
+            -- Add the column index
+            column_indices.append(field.index)
+        -- else: Virtual column (not in file), skip
+
+    ensures: column_indices.returned()
+}
+
+function MaterializedFields(options: ScanOptions) -> Set<FieldRef> {
+    -- Compute the union of fields referenced in filter and projection
+    return options.filter.fields_referenced
+        .union(options.projection.fields_referenced)
+}
+
+
+-- =============================================================================
+-- DATA FLOW: Full predicate pushdown sequence
+-- =============================================================================
+
+-- The complete flow from user code to data filtering:
+--
+-- +-----------------------------------------------------------------------------+
+-- | USER CODE                                                                   |
+-- +-----------------------------------------------------------------------------+
+-- | 1. Create ScannerBuilder with dataset                                       |
+-- | 2. builder.Filter(predicate)  - stores unbound filter                       |
+-- | 3. builder.Project(columns)   - determines materialized fields              |
+-- | 4. builder.Finish()           -> Scanner                                    |
+-- | 5. scanner.ScanBatches() or scanner.ToTable()                               |
+-- +-----------------------------------------------------------------------------+
+--                                    |
+--                                    v
+-- +-----------------------------------------------------------------------------+
+-- | DATASET LEVEL: Partition Pruning                                            |
+-- +-----------------------------------------------------------------------------+
+-- | 6. Scanner calls dataset.GetFragments(filter)                               |
+-- |    For each fragment in dataset:                                            |
+-- |      simplified = SimplifyWithGuarantee(filter, fragment.partition_expr)    |
+-- |      if simplified.is_satisfiable:                                          |
+-- |        yield fragment                                                       |
+-- |      else:                                                                  |
+-- |        SKIP (partition pruned)                                              |
+-- +-----------------------------------------------------------------------------+
+--                                    |
+--                                    v
+-- +-----------------------------------------------------------------------------+
+-- | FRAGMENT LEVEL: Stripe Filtering (ORC-specific)                             |
+-- +-----------------------------------------------------------------------------+
+-- | 7. For each non-pruned Fragment:                                            |
+-- |    a. EnsureFileMetadataCached() / EnsureStatisticsCached()                 |
+-- |       - Load ORC file footer (stripes, column stats)                        |
+-- |       - Cache in fragment for reuse                                         |
+-- |                                                                             |
+-- |    b. FilterStripes(filter) called by ScanBatchesAsync:                     |
+-- |       i.   Simplify filter with partition guarantee                         |
+-- |       ii.  For each field in filter:                                        |
+-- |            - Look up column in schema                                       |
+-- |            - For each stripe: extract column statistics                     |
+-- |            - Convert to guarantee: min <= field <= max                      |
+-- |            - Fold into per-stripe statistics_expressions                    |
+-- |       iii. For each stripe:                                                 |
+-- |            simplified = SimplifyWithGuarantee(filter, stats_expr)           |
+-- |            if simplified.is_satisfiable:                                    |
+-- |              include stripe                                                 |
+-- |            else:                                                            |
+-- |              SKIP (statistics pruned)                                       |
+-- +-----------------------------------------------------------------------------+
+--                                    |
+--                                    v
+-- +-----------------------------------------------------------------------------+
+-- | COLUMN LEVEL: Projection                                                    |
+-- +-----------------------------------------------------------------------------+
+-- | 8. InferColumnProjection()                                                  |
+-- |    - Compute MaterializedFields from filter + projection                    |
+-- |    - Map to ORC column indices                                              |
+-- |    - Only these columns are read from disk                                  |
+-- +-----------------------------------------------------------------------------+
+--                                    |
+--                                    v
+-- +-----------------------------------------------------------------------------+
+-- | FILE READER: Batch Generation                                               |
+-- +-----------------------------------------------------------------------------+
+-- | 9. reader.GetRecordBatchGenerator(stripes, column_projection)               |
+-- |    - Read only selected stripes                                             |
+-- |    - Read only projected columns                                            |
+-- |    - Apply readahead for parallelism                                        |
+-- +-----------------------------------------------------------------------------+
+--                                    |
+--                                    v
+-- +-----------------------------------------------------------------------------+
+-- | POST-SCAN: Filtering and Evolution                                          |
+-- +-----------------------------------------------------------------------------+
+-- | 10. For batches that were NOT fully filtered by statistics:                 |
+-- |     - Apply remaining filter to actual row values                           |
+-- |     - Evolve batch from fragment schema to dataset schema                   |
+-- |     - Apply projection expression                                           |
+-- |     - Yield to user                                                         |
+-- +-----------------------------------------------------------------------------+
+
+-- Performance benefits at each level:
+-- - Partition pruning: Skip entire files (major I/O savings)
+-- - Stripe filtering: Skip portions of files (moderate I/O savings)
+-- - Column projection: Read fewer columns (I/O and memory savings)
+-- - Statistics metadata: Tiny compared to actual data (minimal overhead)
+
+
+-- =============================================================================
+-- External Entities (defined elsewhere or implementation-specific)
+-- =============================================================================
+
+external entity RecordBatch {
+    -- A batch of columnar data with a schema
+    schema: Schema
+    num_rows: Int
+}
+
+external entity Table {
+    -- A collection of record batches with a common schema
+    schema: Schema
+    num_rows: Int
+}
+
+external entity Buffer {
+    -- Raw byte buffer for in-memory data
+    size: Int
+}
+
+external entity FileSystem {
+    -- Abstract filesystem interface (local, S3, GCS, HDFS, etc.)
+}
+
+external entity FileSource {
+    -- Identifies where a file's data comes from
+    kind: path | buffer | custom
+    path: String?
+    buffer: Buffer?
+}
+
+external entity FileFragment extends Fragment {
+    -- A Fragment that is stored in a file with a known format
+    source: FileSource
+    format: FileFormat
+}
+
+external entity FileFormat {
+    -- Base class for file format implementations
+    type_name: String
+}
+
+external entity OrcFileFormat extends FileFormat {
+    type_name: "orc"
+}
+
+external entity ScanOptions {
+    -- Scan-specific options
+    filter: Expression
+    projection: Expression
+    batch_size: Int
+    batch_readahead: Int
+}
+
+external entity Fragment {
+    -- Base class for dataset fragments
+    partition_expression: Expression
+    physical_schema: Schema?
+}
+
+function ReadOrcFileMetadata(source: FileSource) -> OrcFileMetadata
+function OpenOrcReader(source: FileSource, options: ScanOptions) -> OrcReader
+
+external entity OrcReader {
+    schema: Schema
+    GetRecordBatchGenerator(stripes: List<Int>, column_projection: List<Int>, batch_size: Int) -> RecordBatchGenerator
+}
+
+external entity RecordBatchGenerator {
+    -- Async generator yielding record batches
+}
+
+external entity EmptyRecordBatchGenerator extends RecordBatchGenerator {
+    -- Generator that yields no batches
+}
+
+external entity ReadaheadGenerator extends RecordBatchGenerator {
+    -- Generator with readahead buffering
+}
+
+external entity SlicingGenerator extends RecordBatchGenerator {
+    -- Wraps a generator to enforce maximum batch size
+    -- If the source generator produces batches larger than batch_size,
+    -- SlicingGenerator slices them into smaller batches.
+    --
+    -- This ensures consistent batch sizes regardless of source behavior,
+    -- matching Parquet's SlicingGenerator (file_parquet.cc line 1442).
+    source: RecordBatchGenerator
+    batch_size: Int
+}
+
+function SlicingGenerator(source: RecordBatchGenerator, batch_size: Int) -> SlicingGenerator {
+    -- Create a SlicingGenerator wrapping the source generator
+}
