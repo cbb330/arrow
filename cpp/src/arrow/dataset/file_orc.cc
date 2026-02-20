@@ -18,8 +18,10 @@
 #include "arrow/dataset/file_orc.h"
 
 #include <memory>
+#include <optional>
 
 #include "arrow/adapters/orc/adapter.h"
+#include "arrow/compute/api_scalar.h"
 #include "arrow/dataset/dataset_internal.h"
 #include "arrow/dataset/file_base.h"
 #include "arrow/dataset/scanner.h"
@@ -148,6 +150,51 @@ Status OrcSchemaManifest::Make(const std::shared_ptr<Schema>& schema,
   }
 
   return Status::OK();
+}
+
+// Helper function to resolve FieldRef to ORC column index using the manifest
+// Returns std::nullopt if the field is not found or is not a leaf node
+std::optional<int> GetOrcColumnIndex(const compute::FieldRef& field_ref,
+                                      const OrcSchemaManifest& manifest) {
+  // Try to resolve the FieldRef to a field in the schema
+  auto maybe_match = field_ref.FindOne(*manifest.origin_schema);
+  if (!maybe_match.ok()) {
+    // Field not found in schema
+    return std::nullopt;
+  }
+
+  const compute::FieldPath& field_path = *maybe_match;
+
+  // Traverse the manifest to find the corresponding OrcSchemaField
+  const OrcSchemaField* current_field = nullptr;
+
+  // Start with top-level fields
+  for (size_t i = 0; i < field_path.indices().size(); ++i) {
+    int field_index = field_path.indices()[i];
+
+    if (i == 0) {
+      // Top-level field
+      if (field_index < 0 || static_cast<size_t>(field_index) >= manifest.schema_fields.size()) {
+        return std::nullopt;
+      }
+      current_field = &manifest.schema_fields[field_index];
+    } else {
+      // Nested field
+      if (!current_field || field_index < 0 ||
+          static_cast<size_t>(field_index) >= current_field->children.size()) {
+        return std::nullopt;
+      }
+      current_field = &current_field->children[field_index];
+    }
+  }
+
+  // Check if we found a field and if it's a leaf node
+  if (current_field && current_field->is_leaf()) {
+    return current_field->column_index;
+  }
+
+  // Not a leaf node or not found
+  return std::nullopt;
 }
 
 namespace {
