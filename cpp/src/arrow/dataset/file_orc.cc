@@ -386,6 +386,93 @@ struct StripeStatisticsCache {
 };
 
 //
+// PredicateField - Helper structure for resolved predicate fields
+//
+
+struct PredicateField {
+  compute::FieldRef field_ref;
+  int arrow_field_index;
+  int orc_column_index;
+  std::shared_ptr<DataType> data_type;
+  bool supports_statistics;
+};
+
+//
+// ResolvePredicateFields - Resolve field references in predicate to ORC columns
+//
+
+/// Resolve field references in a predicate to PredicateField entities.
+/// Uses the schema manifest to map Arrow fields to ORC column indices.
+/// Only returns fields that are leaves and support statistics.
+///
+/// \param predicate The predicate expression to analyze
+/// \param physical_schema The Arrow physical schema
+/// \param manifest The ORC schema manifest for column mapping
+/// \return Vector of resolved PredicateField entities
+Result<std::vector<PredicateField>> ResolvePredicateFields(
+    const compute::Expression& predicate,
+    const std::shared_ptr<Schema>& physical_schema,
+    const std::shared_ptr<OrcSchemaManifest>& manifest) {
+  std::vector<PredicateField> resolved_fields;
+
+  for (const compute::FieldRef& ref : compute::FieldsInExpression(predicate)) {
+    // Find the field in the Arrow schema
+    ARROW_ASSIGN_OR_RAISE(auto match, ref.FindOneOrNone(*physical_schema));
+
+    if (match.empty()) {
+      // Field not found - skip
+      continue;
+    }
+
+    // Get the top-level schema field
+    const OrcSchemaField* schema_field = &manifest->schema_fields[match[0]];
+    int arrow_field_index = match[0];
+
+    // Traverse nested paths
+    for (size_t i = 1; i < match.indices().size(); ++i) {
+      if (schema_field->field->type()->id() != Type::STRUCT) {
+        return Status::Invalid("Nested paths only supported for structs");
+      }
+
+      int child_index = match[i];
+      if (child_index < 0 ||
+          static_cast<size_t>(child_index) >= schema_field->children.size()) {
+        return Status::Invalid("Invalid nested field index");
+      }
+
+      schema_field = &schema_field->children[child_index];
+    }
+
+    // Skip if not a leaf node (containers don't have statistics)
+    if (!schema_field->is_leaf()) {
+      continue;
+    }
+
+    // Check if this type supports statistics
+    // For initial implementation, only support integer types
+    Type::type type_id = schema_field->field->type()->id();
+    bool supports_stats = (type_id == Type::INT32 || type_id == Type::INT64);
+
+    if (!supports_stats) {
+      // Skip unsupported types
+      continue;
+    }
+
+    // Create PredicateField
+    PredicateField pf;
+    pf.field_ref = ref;
+    pf.arrow_field_index = arrow_field_index;
+    pf.orc_column_index = schema_field->column_index;
+    pf.data_type = schema_field->field->type();
+    pf.supports_statistics = supports_stats;
+
+    resolved_fields.push_back(std::move(pf));
+  }
+
+  return resolved_fields;
+}
+
+//
 // OrcFileFragment implementation
 //
 
