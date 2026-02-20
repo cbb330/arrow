@@ -98,7 +98,7 @@
       "cmake --build . --target arrow_dataset",
       "Unit test: OrcFileFragment construction"
     ],
-    "status": "pending",
+    "status": "complete",
     "depends_on": [1],
     "priority": "P0"
   },
