@@ -47,6 +47,23 @@ struct StripeInformation {
   int64_t first_row_id;
 };
 
+/// \brief Column statistics from ORC file
+/// \details Wraps ORC library's column statistics with Arrow-native interface
+struct ARROW_EXPORT OrcColumnStatistics {
+  /// \brief Whether the column has null values
+  bool has_null;
+  /// \brief Number of values in the column (0 means all nulls)
+  uint64_t num_values;
+  /// \brief Whether minimum value is available
+  bool has_minimum;
+  /// \brief Whether maximum value is available
+  bool has_maximum;
+  /// \brief Minimum value as Arrow Scalar (nullptr if not available)
+  std::shared_ptr<Scalar> minimum;
+  /// \brief Maximum value as Arrow Scalar (nullptr if not available)
+  std::shared_ptr<Scalar> maximum;
+};
+
 /// \class ORCFileReader
 /// \brief Read an Arrow Table or RecordBatch from an ORC file.
 class ARROW_EXPORT ORCFileReader {
@@ -266,6 +283,28 @@ class ARROW_EXPORT ORCFileReader {
   ///
   /// \return A KeyValueMetadata object containing the ORC metadata
   Result<std::shared_ptr<const KeyValueMetadata>> ReadMetadata();
+
+  /// \brief Get file-level column statistics
+  ///
+  /// \param[in] column_index the column index to get statistics for
+  /// \return the column statistics
+  Result<std::shared_ptr<OrcColumnStatistics>> GetColumnStatistics(int column_index);
+
+  /// \brief Get stripe-level column statistics
+  ///
+  /// \param[in] stripe_index the stripe index
+  /// \param[in] column_index the column index to get statistics for
+  /// \return the column statistics
+  Result<std::shared_ptr<OrcColumnStatistics>> GetStripeColumnStatistics(
+      int64_t stripe_index, int column_index);
+
+  /// \brief Get the ORC type tree for column ID mapping
+  ///
+  /// This is needed for building schema manifests that map Arrow schema fields
+  /// to ORC physical column indices.
+  ///
+  /// \return pointer to the ORC Type object (owned by the ORC reader)
+  const void* GetORCType();
 
  private:
   class Impl;
