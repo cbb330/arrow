@@ -104,7 +104,152 @@ struct ARROW_DS_EXPORT OrcSchemaManifest {
   }
 };
 
+/// \brief Cache status for ORC fragment metadata
+enum class OrcCacheStatus {
+  /// No metadata has been cached
+  Uncached,
+  /// Metadata is being loaded (to prevent concurrent loads)
+  Loading,
+  /// Metadata is fully cached
+  Cached
+};
+
+/// \brief Forward declaration for StripeStatisticsCache
+/// Full definition in file_orc.cc to avoid exposing implementation details
+struct StripeStatisticsCache;
+
+/// \brief Forward declarations for ORC types
+/// These avoid including ORC headers in this public header
+namespace orc {
+class Reader;
+class Statistics;
+}  // namespace orc
+
 constexpr char kOrcTypeName[] = "orc";
+
+/// \brief A FileFragment with ORC-specific predicate pushdown capabilities.
+///
+/// Extends FileFragment with support for stripe-level filtering based on
+/// ORC statistics. Similar to ParquetFileFragment but adapted for ORC's
+/// stripe-based structure (vs Parquet's row groups).
+class ARROW_DS_EXPORT OrcFileFragment : public FileFragment {
+ public:
+  /// \brief Split this fragment into one fragment per stripe.
+  ///
+  /// Each returned fragment will select a single stripe from the file.
+  /// Useful for parallel processing.
+  ///
+  /// \param predicate Optional predicate to apply before splitting
+  /// \return Vector of fragments, one per stripe
+  Result<FragmentVector> SplitByStripe(compute::Expression predicate);
+
+  /// \brief Return the stripes selected by this fragment.
+  ///
+  /// If no specific stripes were selected, returns an empty vector
+  /// (meaning all stripes are selected).
+  const std::vector<int>& stripes() const {
+    if (stripes_) return *stripes_;
+    static std::vector<int> empty;
+    return empty;
+  }
+
+  /// \brief Return the ORC file metadata associated with this fragment.
+  ///
+  /// This may return nullptr if the fragment hasn't been scanned yet.
+  /// Use EnsureCompleteMetadata() to force loading.
+  ///
+  /// \return Pointer to orc::Reader (as void* to avoid ORC header dependency)
+  void* metadata();
+
+  /// \brief Ensure this fragment's metadata is loaded into memory.
+  ///
+  /// Loads the ORC file footer containing stripe info, schema, and writer version.
+  /// Thread-safe - only loads once even if called concurrently.
+  ///
+  /// \param reader Optional ORC reader to use (if already opened)
+  /// \return Status
+  Status EnsureCompleteMetadata(void* reader = nullptr);
+
+  /// \brief Clear all cached metadata and statistics.
+  ///
+  /// Forces re-loading on next access. Useful for testing and error recovery.
+  Status ClearCachedMetadata() override;
+
+  /// \brief Return a fragment selecting a filtered subset of this fragment's stripes.
+  ///
+  /// Uses statistics-based predicate pushdown to filter stripes.
+  ///
+  /// \param predicate The predicate to evaluate against stripe statistics
+  /// \return Fragment with filtered stripes
+  Result<std::shared_ptr<Fragment>> Subset(compute::Expression predicate);
+
+  /// \brief Return a fragment selecting specific stripes by index.
+  ///
+  /// \param stripe_ids Vector of stripe indices to include
+  /// \return Fragment with specified stripes
+  Result<std::shared_ptr<Fragment>> Subset(std::vector<int> stripe_ids);
+
+ private:
+  /// \brief Private constructor - use OrcFileFormat to create fragments.
+  OrcFileFragment(FileSource source, std::shared_ptr<FileFormat> format,
+                  compute::Expression partition_expression,
+                  std::shared_ptr<Schema> physical_schema,
+                  std::optional<std::vector<int>> stripes);
+
+  /// \brief Set cached metadata and manifest.
+  ///
+  /// Thread-safe. Only sets once - subsequent calls are ignored.
+  ///
+  /// \param reader Pointer to orc::Reader
+  /// \param manifest Schema manifest for column index mapping
+  /// \return Status
+  Status SetMetadata(void* reader, std::shared_ptr<OrcSchemaManifest> manifest);
+
+  /// \brief Override to opportunistically load metadata.
+  Result<std::shared_ptr<Schema>> ReadPhysicalSchemaImpl() override {
+    ARROW_RETURN_NOT_OK(EnsureCompleteMetadata());
+    return physical_schema_;
+  }
+
+  /// \brief Filter stripes based on predicate and statistics.
+  ///
+  /// \param predicate The predicate to evaluate
+  /// \return Vector of selected stripe indices
+  Result<std::vector<int>> FilterStripes(compute::Expression predicate);
+
+  /// \brief Evaluate predicate against each stripe's statistics.
+  ///
+  /// \param predicate The predicate to simplify per stripe
+  /// \return Vector of simplified expressions, one per stripe
+  Result<std::vector<compute::Expression>> TestStripes(compute::Expression predicate);
+
+  /// \brief Try to count rows using metadata without reading data.
+  ///
+  /// \param predicate The predicate to evaluate
+  /// \return Row count if computable, std::nullopt otherwise
+  Result<std::optional<int64_t>> TryCountRows(compute::Expression predicate);
+
+  OrcFileFormat& orc_format_;
+
+  /// Indices of stripes selected by this fragment.
+  /// If std::nullopt, all stripes are selected.
+  std::optional<std::vector<int>> stripes_;
+
+  /// Cache status for metadata loading
+  OrcCacheStatus cache_status_ = OrcCacheStatus::Uncached;
+
+  /// Cached ORC reader (as void* to avoid exposing orc::Reader in header)
+  void* orc_reader_ = nullptr;
+
+  /// Cached schema manifest for column index mapping
+  std::shared_ptr<OrcSchemaManifest> manifest_;
+
+  /// Cache for stripe-level statistics expressions
+  /// Lazily populated as statistics are processed
+  std::unique_ptr<StripeStatisticsCache> statistics_cache_;
+
+  friend class OrcFileFormat;
+};
 
 /// \brief A FileFormat implementation that reads from and writes to ORC files
 class ARROW_DS_EXPORT OrcFileFormat : public FileFormat {
