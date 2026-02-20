@@ -29,20 +29,125 @@
 #include "arrow/util/logging.h"
 #include "arrow/util/thread_pool.h"
 
+// ORC C++ library headers for type information
+#include "orc/Type.hh"
+
 namespace arrow {
 
 using internal::checked_pointer_cast;
 
 namespace dataset {
 
+namespace {
+
+// Helper function to build OrcSchemaField recursively
+// ORC uses depth-first pre-order traversal: column 0 = root struct, 1+ = data columns
+// column_index is passed by reference and incremented as we traverse
+void BuildSchemaFieldRecursive(const std::shared_ptr<Field>& arrow_field,
+                                const orc::Type* orc_type, int* column_index,
+                                OrcSchemaField* out,
+                                std::unordered_map<int, const OrcSchemaField*>* index_map,
+                                std::unordered_map<const OrcSchemaField*, const OrcSchemaField*>* parent_map) {
+  out->field = arrow_field;
+
+  // Increment column index for this node
+  ++(*column_index);
+  int current_column = *column_index;
+
+  // Determine if this is a leaf node based on ORC type
+  // Leaves are primitive types that have statistics
+  orc::TypeKind kind = orc_type->getKind();
+  bool is_leaf = (kind != orc::STRUCT && kind != orc::LIST && kind != orc::MAP && kind != orc::UNION);
+
+  if (is_leaf) {
+    // Assign column index for leaf nodes (these have statistics)
+    out->column_index = current_column;
+    (*index_map)[current_column] = out;
+  } else {
+    // Container types: recursively process children
+    out->column_index = -1;  // Containers don't have direct statistics
+
+    // Get number of children
+    uint64_t num_children = orc_type->getSubtypeCount();
+    out->children.reserve(num_children);
+
+    for (uint64_t i = 0; i < num_children; ++i) {
+      OrcSchemaField child_field;
+      const orc::Type* child_orc_type = orc_type->getSubtype(i);
+
+      // For struct types, match Arrow field by name
+      // For list/map types, use positional matching
+      std::shared_ptr<Field> child_arrow_field;
+      if (arrow_field->type()->id() == Type::STRUCT) {
+        auto struct_type = std::static_pointer_cast<StructType>(arrow_field->type());
+        child_arrow_field = struct_type->field(static_cast<int>(i));
+      } else if (arrow_field->type()->id() == Type::LIST) {
+        auto list_type = std::static_pointer_cast<ListType>(arrow_field->type());
+        child_arrow_field = list_type->value_field();
+      } else if (arrow_field->type()->id() == Type::MAP) {
+        auto map_type = std::static_pointer_cast<MapType>(arrow_field->type());
+        if (i == 0) {
+          child_arrow_field = map_type->key_field();
+        } else {
+          child_arrow_field = map_type->item_field();
+        }
+      } else {
+        // Fallback: create a dummy field
+        child_arrow_field = field("child_" + std::to_string(i), null());
+      }
+
+      BuildSchemaFieldRecursive(child_arrow_field, child_orc_type, column_index,
+                                 &child_field, index_map, parent_map);
+
+      out->children.push_back(std::move(child_field));
+      (*parent_map)[&out->children.back()] = out;
+    }
+  }
+}
+
+}  // namespace
+
 // OrcSchemaManifest implementation
 Status OrcSchemaManifest::Make(const std::shared_ptr<Schema>& schema,
-                                const void* orc_type, OrcSchemaManifest* manifest) {
-  // TODO(Task #2): Implement BuildOrcSchemaManifest logic
-  // This is a placeholder for Task #1 - actual implementation in Task #2
+                                const void* orc_type_ptr, OrcSchemaManifest* manifest) {
+  if (!orc_type_ptr) {
+    return Status::Invalid("ORC type pointer is null");
+  }
+
+  // Cast void* back to orc::Type*
+  const orc::Type* orc_type = static_cast<const orc::Type*>(orc_type_ptr);
+
+  // Validate that the root ORC type is a STRUCT
+  if (orc_type->getKind() != orc::STRUCT) {
+    return Status::Invalid("ORC root type must be STRUCT");
+  }
+
   manifest->origin_schema = schema;
-  return Status::NotImplemented(
-      "OrcSchemaManifest::Make will be implemented in Task #2");
+  manifest->schema_fields.clear();
+  manifest->column_index_to_field.clear();
+  manifest->child_to_parent.clear();
+
+  // ORC column 0 is the root struct itself
+  // User columns start at index 1
+  int column_index = 0;  // Will be incremented to 1 for first field
+
+  // Build schema fields for each top-level field
+  uint64_t num_fields = orc_type->getSubtypeCount();
+  manifest->schema_fields.reserve(num_fields);
+
+  for (uint64_t i = 0; i < num_fields && i < static_cast<uint64_t>(schema->num_fields()); ++i) {
+    OrcSchemaField field;
+    const orc::Type* child_orc_type = orc_type->getSubtype(i);
+    std::shared_ptr<Field> arrow_field = schema->field(static_cast<int>(i));
+
+    BuildSchemaFieldRecursive(arrow_field, child_orc_type, &column_index, &field,
+                               &manifest->column_index_to_field,
+                               &manifest->child_to_parent);
+
+    manifest->schema_fields.push_back(std::move(field));
+  }
+
+  return Status::OK();
 }
 
 namespace {
