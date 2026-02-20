@@ -75,7 +75,7 @@
       "Unit test: Column index resolution for top-level fields",
       "Unit test: Column index resolution for nested fields"
     ],
-    "status": "pending",
+    "status": "complete",
     "depends_on": [2],
     "priority": "P0"
   },
