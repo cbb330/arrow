@@ -305,6 +305,10 @@ module ArrowFormat
       "Float32"
     end
 
+    def buffer_type
+      :f32
+    end
+
     def build_array(size, validity_buffer, values_buffer)
       Float32Array.new(self, size, validity_buffer, values_buffer)
     end
@@ -325,15 +329,30 @@ module ArrowFormat
       "Float64"
     end
 
+    def buffer_type
+      :f64
+    end
+
     def build_array(size, validity_buffer, values_buffer)
       Float64Array.new(self, size, validity_buffer, values_buffer)
     end
   end
 
-  class TemporalType < Type
+  class TemporalType < PrimitiveType
   end
 
   class DateType < TemporalType
+    attr_reader :unit
+    def initialize(unit)
+      super()
+      @unit = unit
+    end
+
+    def to_flatbuffers
+      fb_type = FB::Date::Data.new
+      fb_type.unit = FB::DateUnit.try_convert(@unit.to_s.upcase)
+      fb_type
+    end
   end
 
   class Date32Type < DateType
@@ -343,8 +362,16 @@ module ArrowFormat
       end
     end
 
+    def initialize
+      super(:day)
+    end
+
     def name
       "Date32"
+    end
+
+    def buffer_type
+      :s32
     end
 
     def build_array(size, validity_buffer, values_buffer)
@@ -359,8 +386,16 @@ module ArrowFormat
       end
     end
 
+    def initialize
+      super(:millisecond)
+    end
+
     def name
       "Date64"
+    end
+
+    def buffer_type
+      :s64
     end
 
     def build_array(size, validity_buffer, values_buffer)
@@ -369,16 +404,33 @@ module ArrowFormat
   end
 
   class TimeType < TemporalType
+    attr_reader :bit_width
     attr_reader :unit
-    def initialize(unit)
+    def initialize(bit_width, unit)
       super()
+      @bit_width = bit_width
       @unit = unit
+    end
+
+    def to_flatbuffers
+      fb_type = FB::Time::Data.new
+      fb_type.bit_width = @bit_width
+      fb_type.unit = FB::TimeUnit.try_convert(@unit.to_s.upcase)
+      fb_type
     end
   end
 
   class Time32Type < TimeType
+    def initialize(unit)
+      super(32, unit)
+    end
+
     def name
       "Time32"
+    end
+
+    def buffer_type
+      :s32
     end
 
     def build_array(size, validity_buffer, values_buffer)
@@ -387,8 +439,16 @@ module ArrowFormat
   end
 
   class Time64Type < TimeType
+    def initialize(unit)
+      super(64, unit)
+    end
+
     def name
       "Time64"
+    end
+
+    def buffer_type
+      :s64
     end
 
     def build_array(size, validity_buffer, values_buffer)
@@ -398,28 +458,64 @@ module ArrowFormat
 
   class TimestampType < TemporalType
     attr_reader :unit
-    attr_reader :timezone
-    def initialize(unit, timezone)
+    attr_reader :time_zone
+    def initialize(unit, time_zone)
       super()
       @unit = unit
-      @timezone = timezone
+      @time_zone = time_zone
     end
 
     def name
       "Timestamp"
     end
 
+    def buffer_type
+      :s64
+    end
+
     def build_array(size, validity_buffer, values_buffer)
       TimestampArray.new(self, size, validity_buffer, values_buffer)
+    end
+
+    def to_flatbuffers
+      fb_type = FB::Timestamp::Data.new
+      fb_type.unit = FB::TimeUnit.try_convert(@unit.to_s.upcase)
+      fb_type.timezone = @time_zone
+      fb_type
     end
   end
 
   class IntervalType < TemporalType
+    class << self
+      def singleton
+        @singleton ||= new
+      end
+    end
+
+    attr_reader :unit
+    def initialize(unit)
+      super()
+      @unit = unit
+    end
+
+    def to_flatbuffers
+      fb_type = FB::Interval::Data.new
+      fb_type.unit = FB::IntervalUnit.try_convert(@unit.to_s.upcase)
+      fb_type
+    end
   end
 
   class YearMonthIntervalType < IntervalType
+    def initialize
+      super(:year_month)
+    end
+
     def name
       "YearMonthInterval"
+    end
+
+    def buffer_type
+      :s32
     end
 
     def build_array(size, validity_buffer, values_buffer)
@@ -428,8 +524,16 @@ module ArrowFormat
   end
 
   class DayTimeIntervalType < IntervalType
+    def initialize
+      super(:day_time)
+    end
+
     def name
       "DayTimeInterval"
+    end
+
+    def buffer_type
+      :s32
     end
 
     def build_array(size, validity_buffer, values_buffer)
@@ -438,8 +542,16 @@ module ArrowFormat
   end
 
   class MonthDayNanoIntervalType < IntervalType
+    def initialize
+      super(:month_day_nano)
+    end
+
     def name
       "MonthDayNanoInterval"
+    end
+
+    def buffer_types
+      @buffer_types ||= [:s32, :s32, :s64]
     end
 
     def build_array(size, validity_buffer, values_buffer)
@@ -461,8 +573,18 @@ module ArrowFormat
       "Duration"
     end
 
+    def buffer_type
+      :s64
+    end
+
     def build_array(size, validity_buffer, values_buffer)
       DurationArray.new(self, size, validity_buffer, values_buffer)
+    end
+
+    def to_flatbuffers
+      fb_type = FB::Duration::Data.new
+      fb_type.unit = FB::TimeUnit.try_convert(@unit.to_s.upcase)
+      fb_type
     end
   end
 
@@ -478,6 +600,14 @@ module ArrowFormat
 
     def name
       "Binary"
+    end
+
+    def offset_buffer_type
+      :s32 # TODO: big endian support
+    end
+
+    def encoding
+      Encoding::ASCII_8BIT
     end
 
     def build_array(size, validity_buffer, offsets_buffer, values_buffer)
@@ -504,6 +634,14 @@ module ArrowFormat
       "LargeBinary"
     end
 
+    def offset_buffer_type
+      :s64 # TODO: big endian support
+    end
+
+    def encoding
+      Encoding::ASCII_8BIT
+    end
+
     def build_array(size, validity_buffer, offsets_buffer, values_buffer)
       LargeBinaryArray.new(self,
                            size,
@@ -528,6 +666,14 @@ module ArrowFormat
       "UTF8"
     end
 
+    def offset_buffer_type
+      :s32 # TODO: big endian support
+    end
+
+    def encoding
+      Encoding::UTF_8
+    end
+
     def build_array(size, validity_buffer, offsets_buffer, values_buffer)
       UTF8Array.new(self, size, validity_buffer, offsets_buffer, values_buffer)
     end
@@ -548,12 +694,24 @@ module ArrowFormat
       "LargeUTF8"
     end
 
+    def offset_buffer_type
+      :s64 # TODO: big endian support
+    end
+
+    def encoding
+      Encoding::UTF_8
+    end
+
     def build_array(size, validity_buffer, offsets_buffer, values_buffer)
       LargeUTF8Array.new(self,
                          size,
                          validity_buffer,
                          offsets_buffer,
                          values_buffer)
+    end
+
+    def to_flatbuffers
+      FB::LargeUtf8::Data.new
     end
   end
 
@@ -571,6 +729,12 @@ module ArrowFormat
     def build_array(size, validity_buffer, values_buffer)
       FixedSizeBinaryArray.new(self, size, validity_buffer, values_buffer)
     end
+
+    def to_flatbuffers
+      fb_type = FB::FixedSizeBinary::Data.new
+      fb_type.byte_width = @byte_width
+      fb_type
+    end
   end
 
   class DecimalType < FixedSizeBinaryType
@@ -580,6 +744,14 @@ module ArrowFormat
       super(byte_width)
       @precision = precision
       @scale = scale
+    end
+
+    def to_flatbuffers
+      fb_type = FB::Decimal::Data.new
+      fb_type.bit_width = @byte_width * 8
+      fb_type.precision = @precision
+      fb_type.scale = @scale
+      fb_type
     end
   end
 
@@ -617,7 +789,6 @@ module ArrowFormat
       super()
       @child = child
     end
-
   end
 
   class ListType < VariableSizeListType
@@ -625,8 +796,16 @@ module ArrowFormat
       "List"
     end
 
+    def offset_buffer_type
+      :s32 # TODO: big endian support
+    end
+
     def build_array(size, validity_buffer, offsets_buffer, child)
       ListArray.new(self, size, validity_buffer, offsets_buffer, child)
+    end
+
+    def to_flatbuffers
+      FB::List::Data.new
     end
   end
 
@@ -635,8 +814,16 @@ module ArrowFormat
       "LargeList"
     end
 
+    def offset_buffer_type
+      :s64 # TODO: big endian support
+    end
+
     def build_array(size, validity_buffer, offsets_buffer, child)
       LargeListArray.new(self, size, validity_buffer, offsets_buffer, child)
+    end
+
+    def to_flatbuffers
+      FB::LargeList::Data.new
     end
   end
 
@@ -653,6 +840,10 @@ module ArrowFormat
 
     def build_array(size, validity_buffer, children)
       StructArray.new(self, size, validity_buffer, children)
+    end
+
+    def to_flatbuffers
+      FB::Struct::Data.new
     end
   end
 
@@ -681,16 +872,25 @@ module ArrowFormat
       "Map"
     end
 
+    def offset_buffer_type
+      :s32 # TODO: big endian support
+    end
+
     def build_array(size, validity_buffer, offsets_buffer, child)
       MapArray.new(self, size, validity_buffer, offsets_buffer, child)
+    end
+
+    def to_flatbuffers
+      FB::Map::Data.new
     end
   end
 
   class UnionType < Type
     attr_reader :children
     attr_reader :type_ids
-    def initialize(children, type_ids)
+    def initialize(mode, children, type_ids)
       super()
+      @mode = mode
       @children = children
       @type_ids = type_ids
       @type_indexes = {}
@@ -699,9 +899,20 @@ module ArrowFormat
     def resolve_type_index(type)
       @type_indexes[type] ||= @type_ids.index(type)
     end
+
+    def to_flatbuffers
+      fb_type = FB::Union::Data.new
+      fb_type.mode = FB::UnionMode.try_convert(@mode.to_s.capitalize)
+      fb_type.type_ids = @type_ids
+      fb_type
+    end
   end
 
   class DenseUnionType < UnionType
+    def initialize(children, type_ids)
+      super(:dense, children, type_ids)
+    end
+
     def name
       "DenseUnion"
     end
@@ -712,6 +923,10 @@ module ArrowFormat
   end
 
   class SparseUnionType < UnionType
+    def initialize(children, type_ids)
+      super(:sparse, children, type_ids)
+    end
+
     def name
       "SparseUnion"
     end
@@ -739,12 +954,26 @@ module ArrowFormat
       "Dictionary"
     end
 
-    def build_array(size, validity_buffer, indices_buffer, dictionary)
+    def build_array(size, validity_buffer, indices_buffer, dictionaries)
       DictionaryArray.new(self,
                           size,
                           validity_buffer,
                           indices_buffer,
-                          dictionary)
+                          dictionaries)
+    end
+
+    def build_fb_field(fb_field, field)
+      fb_dictionary_encoding = FB::DictionaryEncoding::Data.new
+      fb_dictionary_encoding.id = field.dictionary_id
+      fb_int = FB::Int::Data.new
+      fb_int.bit_width = @index_type.bit_width
+      fb_int.signed = @index_type.signed?
+      fb_dictionary_encoding.index_type = fb_int
+      fb_dictionary_encoding.ordered = @ordered
+      fb_dictionary_encoding.dictionary_kind =
+        FB::DictionaryKind::DENSE_ARRAY
+      fb_field.type = @value_type.to_flatbuffers
+      fb_field.dictionary = fb_dictionary_encoding
     end
   end
 end

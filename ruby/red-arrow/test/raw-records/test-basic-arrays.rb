@@ -177,6 +177,16 @@ module RawRecordsBasicArraysTests
     assert_equal(records, actual_records(target))
   end
 
+  def test_large_string
+    records = [
+      ["Ruby"],
+      [nil],
+      ["\u3042"], # U+3042 HIRAGANA LETTER A
+    ]
+    target = build({column: :large_string}, records)
+    assert_equal(records, actual_records(target))
+  end
+
   def test_date32
     records = [
       [Date.new(1960, 1, 1)],
@@ -394,6 +404,46 @@ module RawRecordsBasicArraysTests
       [{month: 2, day: 3, nanosecond: 400}],
     ]
     target = build({column: :month_day_nano_interval}, records)
+    assert_equal(records, actual_records(target))
+  end
+
+  def test_duration_second
+    records = [
+      [0],
+      [nil],
+      [100],
+    ]
+    target = build({column: {type: :duration, unit: :second}}, records)
+    assert_equal(records, actual_records(target))
+  end
+
+  def test_duration_milli
+    records = [
+      [0],
+      [nil],
+      [100],
+    ]
+    target = build({column: {type: :duration, unit: :milli}}, records)
+    assert_equal(records, actual_records(target))
+  end
+
+  def test_duration_micro
+    records = [
+      [0],
+      [nil],
+      [100],
+    ]
+    target = build({column: {type: :duration, unit: :micro}}, records)
+    assert_equal(records, actual_records(target))
+  end
+
+  def test_duration_nano
+    records = [
+      [0],
+      [nil],
+      [100],
+    ]
+    target = build({column: {type: :duration, unit: :nano}}, records)
     assert_equal(records, actual_records(target))
   end
 end

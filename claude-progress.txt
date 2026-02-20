@@ -1,0 +1,46 @@
+# Claude Progress Log
+
+## Session 1 - 2026-02-20
+
+### Task 0: Extend ORC adapter with column statistics APIs
+
+**Status**: Implementation complete, awaiting verification
+
+**Changes made**:
+1. Added `OrcColumnStatistics` struct in adapter.h
+   - Provides Arrow-native interface for ORC statistics
+   - Fields: has_null, num_values, has_minimum, has_maximum, minimum, maximum
+
+2. Added public methods to ORCFileReader:
+   - `GetColumnStatistics(int column_index)` - file-level statistics
+   - `GetStripeColumnStatistics(int64_t stripe_index, int column_index)` - stripe-level statistics
+   - `GetORCType()` - exposes ORC type tree for column ID mapping
+
+3. Implemented in ORCFileReader::Impl:
+   - `GetColumnStatistics()` - wraps reader_->getStatistics()
+   - `GetStripeColumnStatistics()` - wraps reader_->getStripeStatistics()
+   - `GetORCType()` - wraps reader_->getType()
+   - `ConvertColumnStatistics()` - converts liborc statistics to Arrow Scalars
+     * Supports IntegerColumnStatistics -> Int64Scalar
+     * Supports DoubleColumnStatistics -> DoubleScalar
+     * Supports StringColumnStatistics -> StringScalar
+
+**Verification needed**:
+- Build environment has configuration issues (missing Protobuf, RapidJSON)
+- Code review complete - no syntax errors found
+- Compilation verification pending proper build environment
+
+**Files modified**:
+- cpp/src/arrow/adapters/orc/adapter.h
+- cpp/src/arrow/adapters/orc/adapter.cc
+
+**Commit status**:
+- Local commit created: b36d1ed9df
+- Branch: task-0-column-statistics-apis
+- Push blocked: Network proxy issue (403 tunnel failed)
+
+**Next steps**:
+- Push branch to remote when network access available
+- Create PR and merge
+- Verify compilation in clean build environment
+- Task 0.5: Implement stripe-selective record batch generation

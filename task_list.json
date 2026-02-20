@@ -1,0 +1,765 @@
+[
+  {
+    "id": 0,
+    "phase": "Prerequisites",
+    "task": "Extend ORC adapter with column statistics APIs",
+    "description": "CRITICAL PREREQUISITE: The current ORC adapter lacks APIs to access stripe-level column statistics. Must add: (1) ColumnStatistics struct with has_null, num_values, min/max, is_deprecated, (2) GetStripeColumnStatistics(stripe, column) method, (3) Access to ORC type tree for column index mapping. This blocks all predicate pushdown work.",
+    "files_to_modify": [
+      "cpp/src/arrow/adapters/orc/adapter.h",
+      "cpp/src/arrow/adapters/orc/adapter.cc"
+    ],
+    "parquet_reference": null,
+    "verification": [
+      "cmake --build . --target arrow_orc",
+      "Unit test: GetStripeColumnStatistics returns valid statistics for int32/int64"
+    ],
+    "status": "pending",
+    "depends_on": [],
+    "priority": "P0"
+  },
+  {
+    "id": 1,
+    "phase": "Core Data Structures",
+    "task": "Add OrcSchemaManifest and OrcSchemaField structures",
+    "description": "Create OrcSchemaManifest and OrcSchemaField classes to map Arrow schema fields to ORC physical column indices. Required for nested type support. Mirrors Parquet's SchemaManifest design.",
+    "files_to_modify": [
+      "cpp/src/arrow/dataset/file_orc.h",
+      "cpp/src/arrow/dataset/file_orc.cc"
+    ],
+    "parquet_reference": {
+      "concept": "parquet::arrow::SchemaManifest",
+      "file": "parquet/arrow/schema.h",
+      "notes": "Idea reuse - create ORC-specific version following same pattern"
+    },
+    "verification": [
+      "cmake --build . --target arrow_dataset",
+      "Unit test: Manifest construction from ORC metadata"
+    ],
+    "status": "pending",
+    "depends_on": [0],
+    "priority": "P0"
+  },
+  {
+    "id": 2,
+    "phase": "Core Data Structures",
+    "task": "Implement BuildOrcSchemaManifest function",
+    "description": "Create function that builds schema manifest from ORC file metadata. Walk Arrow schema and ORC type tree in parallel, extract column indices. For leaf fields, store column_index for statistics lookup. For containers, mark as non-leaf.",
+    "files_to_modify": [
+      "cpp/src/arrow/dataset/file_orc.cc"
+    ],
+    "parquet_reference": {
+      "concept": "Schema manifest building",
+      "notes": "ORC type tree is depth-first pre-order (col 0 = root struct), differs from Parquet"
+    },
+    "verification": [
+      "Unit test: Manifest building for flat schemas",
+      "Unit test: Manifest building for nested schemas (struct, list, map)"
+    ],
+    "status": "pending",
+    "depends_on": [1],
+    "priority": "P0"
+  },
+  {
+    "id": 3,
+    "phase": "Core Data Structures",
+    "task": "Implement GetOrcColumnIndex function",
+    "description": "Create function that resolves FieldRef to ORC column index using manifest. Handle top-level fields directly and nested fields by traversing manifest tree. Return null if not found or not a leaf.",
+    "files_to_modify": [
+      "cpp/src/arrow/dataset/file_orc.cc"
+    ],
+    "parquet_reference": {
+      "concept": "Column index resolution via manifest",
+      "notes": "Similar to Parquet but ORC indices start at 1 for user columns"
+    },
+    "verification": [
+      "Unit test: Column index resolution for top-level fields",
+      "Unit test: Column index resolution for nested fields"
+    ],
+    "status": "pending",
+    "depends_on": [2],
+    "priority": "P0"
+  },
+  {
+    "id": 4,
+    "phase": "Core Data Structures",
+    "task": "Create OrcFileFragment class",
+    "description": "Extend FileFragment with ORC-specific predicate pushdown capabilities. Add fields: stripes (optional list of selected indices), metadata (OrcFileMetadata), manifest (OrcSchemaManifest), statistics_cache (StripeStatisticsCache), cache_status enum.",
+    "files_to_modify": [
+      "cpp/src/arrow/dataset/file_orc.h",
+      "cpp/src/arrow/dataset/file_orc.cc"
+    ],
+    "parquet_reference": {
+      "concept": "ParquetFileFragment",
+      "file": "cpp/src/arrow/dataset/file_parquet.h",
+      "lines": "158-235",
+      "notes": "Mirror structure: row_groups_ -> stripes_, statistics_expressions_ -> stripe_guarantees_, etc."
+    },
+    "verification": [
+      "cmake --build . --target arrow_dataset",
+      "Unit test: OrcFileFragment construction"
+    ],
+    "status": "pending",
+    "depends_on": [1],
+    "priority": "P0"
+  },
+  {
+    "id": 5,
+    "phase": "Core Data Structures",
+    "task": "Implement StripeStatisticsCache structure",
+    "description": "Create cache class with: stripe_guarantees (list of Expression per stripe), fields_processed (set tracking processed fields), statistics_complete (list of bool per column). Protected by mutex for thread safety.",
+    "files_to_modify": [
+      "cpp/src/arrow/dataset/file_orc.cc"
+    ],
+    "parquet_reference": {
+      "concept": "statistics_expressions_ and statistics_expressions_complete_",
+      "file": "cpp/src/arrow/dataset/file_parquet.h",
+      "lines": "224-227",
+      "notes": "Same caching pattern, different naming"
+    },
+    "verification": [
+      "Unit test: Cache initialization",
+      "Unit test: Thread-safe access"
+    ],
+    "status": "pending",
+    "depends_on": [4],
+    "priority": "P0"
+  },
+  {
+    "id": 6,
+    "phase": "Metadata Loading",
+    "task": "Implement EnsureFileMetadataCached function",
+    "description": "Load ORC file metadata if not cached. Read footer containing stripe info, schema, writer version. Set physical_schema from metadata. Thread-safe with mutex.",
+    "files_to_modify": [
+      "cpp/src/arrow/dataset/file_orc.cc"
+    ],
+    "parquet_reference": {
+      "concept": "EnsureCompleteMetadata",
+      "file": "cpp/src/arrow/dataset/file_parquet.cc",
+      "lines": "802-870",
+      "notes": "Same lazy loading pattern with mutex protection"
+    },
+    "verification": [
+      "Unit test: Metadata loading",
+      "Unit test: Caching (second call doesn't reload)"
+    ],
+    "status": "pending",
+    "depends_on": [4],
+    "priority": "P0"
+  },
+  {
+    "id": 7,
+    "phase": "Metadata Loading",
+    "task": "Implement EnsureManifestCached function",
+    "description": "Build and cache schema manifest if not done. Requires metadata first. Call BuildOrcSchemaManifest. Thread-safe.",
+    "files_to_modify": [
+      "cpp/src/arrow/dataset/file_orc.cc"
+    ],
+    "parquet_reference": {
+      "concept": "Manifest caching in SetMetadata",
+      "file": "cpp/src/arrow/dataset/file_parquet.cc",
+      "notes": "Part of EnsureCompleteMetadata flow"
+    },
+    "verification": [
+      "Unit test: Manifest caching",
+      "Unit test: Immutability once set"
+    ],
+    "status": "pending",
+    "depends_on": [2, 6],
+    "priority": "P0"
+  },
+  {
+    "id": 8,
+    "phase": "Metadata Loading",
+    "task": "Implement EnsureStatisticsCached function",
+    "description": "Initialize statistics cache if not done. Create stripe_guarantees with literal(true) per stripe, empty fields_processed, statistics_complete all false. Idempotent.",
+    "files_to_modify": [
+      "cpp/src/arrow/dataset/file_orc.cc"
+    ],
+    "parquet_reference": {
+      "concept": "Statistics expressions initialization",
+      "notes": "Implicit in Parquet's SetMetadata, make explicit for ORC"
+    },
+    "verification": [
+      "Unit test: Cache initialization",
+      "Unit test: Idempotency"
+    ],
+    "status": "pending",
+    "depends_on": [5],
+    "priority": "P0"
+  },
+  {
+    "id": 9,
+    "phase": "Predicate Evaluation",
+    "task": "Implement ResolvePredicateFields function",
+    "description": "Resolve field references in predicate to PredicateField entities using manifest. Return list with: field_ref, arrow_field_index, orc_column_index, data_type, supports_statistics. Skip non-leaf or unsupported types.",
+    "files_to_modify": [
+      "cpp/src/arrow/dataset/file_orc.cc"
+    ],
+    "parquet_reference": {
+      "concept": "Field resolution in TestRowGroups",
+      "file": "cpp/src/arrow/dataset/file_parquet.cc",
+      "notes": "Similar pattern but uses ORC manifest"
+    },
+    "verification": [
+      "Unit test: Resolution for supported types (int32, int64)",
+      "Unit test: Skipping unsupported types",
+      "Unit test: Nested field resolution"
+    ],
+    "status": "pending",
+    "depends_on": [3, 7],
+    "priority": "P0"
+  },
+  {
+    "id": 10,
+    "phase": "Predicate Evaluation",
+    "task": "Implement DeriveFieldGuarantee function",
+    "description": "Derive guarantee expression from stripe column statistics. Handle: all-null (num_values=0), min/max available, incomplete stats. Validate not deprecated/corrupted. Core of predicate pushdown.",
+    "files_to_modify": [
+      "cpp/src/arrow/dataset/file_orc.cc"
+    ],
+    "parquet_reference": {
+      "concept": "EvaluateStatisticsAsExpression",
+      "file": "cpp/src/arrow/dataset/file_parquet.h",
+      "lines": "184-189",
+      "notes": "Same logic, different statistics API"
+    },
+    "verification": [
+      "Unit test: All-null case",
+      "Unit test: Min/max range case",
+      "Unit test: Single value (min=max)",
+      "Unit test: Deprecated stats ignored",
+      "Unit test: Corrupted stats (min>max) returns null"
+    ],
+    "status": "pending",
+    "depends_on": [9],
+    "priority": "P0"
+  },
+  {
+    "id": 11,
+    "phase": "Predicate Evaluation",
+    "task": "Use SimplifyWithGuarantee from Arrow compute",
+    "description": "Use compute::SimplifyWithGuarantee for expression simplification. This is shared infrastructure. Create FoldingAnd helper for combining guarantees.",
+    "files_to_modify": [
+      "cpp/src/arrow/dataset/file_orc.cc"
+    ],
+    "parquet_reference": {
+      "concept": "SimplifyWithGuarantee usage",
+      "file": "cpp/src/arrow/dataset/file_parquet.cc",
+      "lines": "939, 980",
+      "notes": "INFRA REUSE - this is format-agnostic shared code"
+    },
+    "verification": [
+      "Unit test: x > 10 with guarantee x >= 15 -> true",
+      "Unit test: x < 5 with guarantee x >= 15 -> false"
+    ],
+    "status": "pending",
+    "depends_on": [10],
+    "priority": "P0"
+  },
+  {
+    "id": 12,
+    "phase": "Predicate Evaluation",
+    "task": "Implement TestStripes function",
+    "description": "Core statistics evaluation. Lock mutex, simplify with partition expr, resolve fields, load uncached statistics into cache, return per-stripe simplified expressions. Mirrors TestRowGroups.",
+    "files_to_modify": [
+      "cpp/src/arrow/dataset/file_orc.cc"
+    ],
+    "parquet_reference": {
+      "concept": "TestRowGroups",
+      "file": "cpp/src/arrow/dataset/file_parquet.cc",
+      "lines": "933-983",
+      "notes": "IDEA REUSE - follow same structure, adapt for stripes"
+    },
+    "verification": [
+      "Unit test: Batch stripe evaluation",
+      "Unit test: Incremental cache population",
+      "Unit test: Partition-level filtering"
+    ],
+    "status": "pending",
+    "depends_on": [8, 9, 11],
+    "priority": "P0"
+  },
+  {
+    "id": 13,
+    "phase": "Predicate Evaluation",
+    "task": "Implement FilterStripes function",
+    "description": "Main entry point. Ensure metadata/manifest/cache loaded. Call TestStripes. Return StripeFilterResult with selected_indices and skipped_count. Skip empty stripes.",
+    "files_to_modify": [
+      "cpp/src/arrow/dataset/file_orc.cc"
+    ],
+    "parquet_reference": {
+      "concept": "FilterRowGroups",
+      "file": "cpp/src/arrow/dataset/file_parquet.cc",
+      "lines": "918-931",
+      "notes": "Simple wrapper around TestStripes"
+    },
+    "verification": [
+      "Unit test: Basic stripe filtering",
+      "Unit test: No stripes selected",
+      "Unit test: All stripes selected"
+    ],
+    "status": "pending",
+    "depends_on": [6, 7, 12],
+    "priority": "P0"
+  },
+  {
+    "id": 14,
+    "phase": "Scan Integration",
+    "task": "Update ScanBatchesAsync to use FilterStripes",
+    "description": "Integrate FilterStripes into scan path. Add pre-filtering if metadata cached. Early exit for empty result. Pass selected stripes to reader. Add SlicingGenerator.",
+    "files_to_modify": [
+      "cpp/src/arrow/dataset/file_orc.cc"
+    ],
+    "parquet_reference": {
+      "concept": "ScanBatchesAsync with FilterRowGroups",
+      "file": "cpp/src/arrow/dataset/file_parquet.cc",
+      "lines": "619-636",
+      "notes": "Same integration pattern"
+    },
+    "verification": [
+      "Integration test: Scan with filter skips stripes",
+      "Integration test: Pre-filtering optimization",
+      "Integration test: Empty result handling"
+    ],
+    "status": "pending",
+    "depends_on": [13],
+    "priority": "P0"
+  },
+  {
+    "id": 15,
+    "phase": "Count Optimization",
+    "task": "Implement OrcTryCountRows function",
+    "description": "Count rows from metadata when possible. Fast path for no field refs. Use TestStripes, sum rows for literal(true), return null if any not literal.",
+    "files_to_modify": [
+      "cpp/src/arrow/dataset/file_orc.cc"
+    ],
+    "parquet_reference": {
+      "concept": "TryCountRows",
+      "file": "cpp/src/arrow/dataset/file_parquet.cc",
+      "lines": "986-1010",
+      "notes": "Same optimization pattern"
+    },
+    "verification": [
+      "Unit test: Count with no field refs",
+      "Unit test: All stripes matched",
+      "Unit test: All stripes excluded",
+      "Unit test: Partial matches returns null"
+    ],
+    "status": "pending",
+    "depends_on": [12],
+    "priority": "P1"
+  },
+  {
+    "id": 16,
+    "phase": "Count Optimization",
+    "task": "Integrate OrcTryCountRows into CountRows",
+    "description": "Modify CountRows to use TryCountRows optimization. If returns value, use directly. Otherwise fall back to full scan.",
+    "files_to_modify": [
+      "cpp/src/arrow/dataset/file_orc.cc"
+    ],
+    "parquet_reference": {
+      "concept": "CountRows with TryCountRows",
+      "file": "cpp/src/arrow/dataset/file_parquet.cc",
+      "notes": "Same pattern"
+    },
+    "verification": [
+      "Unit test: Fast count with simple filter",
+      "Unit test: Fallback to full scan"
+    ],
+    "status": "pending",
+    "depends_on": [14, 15],
+    "priority": "P1"
+  },
+  {
+    "id": 17,
+    "phase": "Fragment Operations",
+    "task": "Implement OrcFileFragment::Subset",
+    "description": "Create new fragment with filtered stripes. Share immutable metadata/manifest, fresh statistics_cache.",
+    "files_to_modify": [
+      "cpp/src/arrow/dataset/file_orc.cc"
+    ],
+    "parquet_reference": {
+      "concept": "Subset",
+      "file": "cpp/src/arrow/dataset/file_parquet.cc",
+      "lines": "893-897",
+      "notes": "Same pattern"
+    },
+    "verification": [
+      "Unit test: Subset creation",
+      "Unit test: Metadata/manifest sharing",
+      "Unit test: Fresh cache"
+    ],
+    "status": "pending",
+    "depends_on": [13],
+    "priority": "P1"
+  },
+  {
+    "id": 18,
+    "phase": "Fragment Operations",
+    "task": "Implement OrcFileFragment::SplitByStripe",
+    "description": "Split fragment into one per stripe. Useful for parallel processing.",
+    "files_to_modify": [
+      "cpp/src/arrow/dataset/file_orc.cc"
+    ],
+    "parquet_reference": {
+      "concept": "SplitByRowGroup",
+      "file": "cpp/src/arrow/dataset/file_parquet.cc",
+      "lines": "873-889",
+      "notes": "Same pattern"
+    },
+    "verification": [
+      "Unit test: Split into per-stripe fragments",
+      "Unit test: Metadata sharing"
+    ],
+    "status": "pending",
+    "depends_on": [13],
+    "priority": "P1"
+  },
+  {
+    "id": 19,
+    "phase": "Thread Safety",
+    "task": "Add mutex protection for all cache operations",
+    "description": "Add physical_schema_mutex_ to OrcFileFragment. Protect all cache reads/writes. Match Parquet's thread safety model.",
+    "files_to_modify": [
+      "cpp/src/arrow/dataset/file_orc.h",
+      "cpp/src/arrow/dataset/file_orc.cc"
+    ],
+    "parquet_reference": {
+      "concept": "physical_schema_mutex_ usage",
+      "file": "cpp/src/arrow/dataset/file_parquet.cc",
+      "lines": "798, 803, 923, 935",
+      "notes": "Same locking pattern"
+    },
+    "verification": [
+      "Unit test: Concurrent scans on same fragment",
+      "Unit test: No data corruption"
+    ],
+    "status": "pending",
+    "depends_on": [13],
+    "priority": "P0"
+  },
+  {
+    "id": 20,
+    "phase": "Testing",
+    "task": "Add basic predicate pushdown tests",
+    "description": "Add tests for basic predicates: =, !=, <, <=, >, >=. Test int32/int64. Verify stripe filtering.",
+    "files_to_modify": [
+      "cpp/src/arrow/dataset/file_orc_test.cc"
+    ],
+    "parquet_reference": {
+      "concept": "PredicatePushdown test",
+      "file": "cpp/src/arrow/dataset/file_parquet_test.cc",
+      "lines": "639-693",
+      "notes": "INFRA REUSE - same test structure, ORC-specific data"
+    },
+    "verification": [
+      "All new tests pass"
+    ],
+    "status": "pending",
+    "depends_on": [14],
+    "priority": "P1"
+  },
+  {
+    "id": 21,
+    "phase": "Testing",
+    "task": "Add CountRowsPredicatePushdown test",
+    "description": "Test count optimization with predicates.",
+    "files_to_modify": [
+      "cpp/src/arrow/dataset/file_orc_test.cc"
+    ],
+    "parquet_reference": {
+      "concept": "CountRowsPredicatePushdown",
+      "file": "cpp/src/arrow/dataset/file_parquet_test.cc",
+      "lines": "307-376",
+      "notes": "INFRA REUSE - same test pattern"
+    },
+    "verification": [
+      "All new tests pass"
+    ],
+    "status": "pending",
+    "depends_on": [16],
+    "priority": "P1"
+  },
+  {
+    "id": 22,
+    "phase": "Testing",
+    "task": "Add PredicatePushdownStripeFragments test",
+    "description": "Test predicate pushdown with stripe-level fragments.",
+    "files_to_modify": [
+      "cpp/src/arrow/dataset/file_orc_test.cc"
+    ],
+    "parquet_reference": {
+      "concept": "PredicatePushdownRowGroupFragments",
+      "file": "cpp/src/arrow/dataset/file_parquet_test.cc",
+      "lines": "694-749",
+      "notes": "Same pattern, stripes instead of row groups"
+    },
+    "verification": [
+      "All new tests pass"
+    ],
+    "status": "pending",
+    "depends_on": [18],
+    "priority": "P1"
+  },
+  {
+    "id": 23,
+    "phase": "Testing",
+    "task": "Add CachedMetadata test",
+    "description": "Test metadata caching behavior.",
+    "files_to_modify": [
+      "cpp/src/arrow/dataset/file_orc_test.cc"
+    ],
+    "parquet_reference": {
+      "concept": "CachedMetadata",
+      "file": "cpp/src/arrow/dataset/file_parquet_test.cc",
+      "lines": "378-435",
+      "notes": "Same caching test pattern"
+    },
+    "verification": [
+      "All new tests pass"
+    ],
+    "status": "pending",
+    "depends_on": [6],
+    "priority": "P1"
+  },
+  {
+    "id": 24,
+    "phase": "Testing",
+    "task": "Add MultithreadedScan test",
+    "description": "Test concurrent scans on same fragment.",
+    "files_to_modify": [
+      "cpp/src/arrow/dataset/file_orc_test.cc"
+    ],
+    "parquet_reference": {
+      "concept": "MultithreadedScan",
+      "file": "cpp/src/arrow/dataset/file_parquet_test.cc",
+      "lines": "436-460",
+      "notes": "Critical for thread safety validation"
+    },
+    "verification": [
+      "All new tests pass"
+    ],
+    "status": "pending",
+    "depends_on": [19],
+    "priority": "P1"
+  },
+  {
+    "id": 25,
+    "phase": "Testing",
+    "task": "Add statistics edge case tests",
+    "description": "Test: all-null stripes, single-value stripes, missing statistics, deprecated statistics, corrupted statistics (min>max).",
+    "files_to_modify": [
+      "cpp/src/arrow/dataset/file_orc_test.cc"
+    ],
+    "parquet_reference": {
+      "notes": "ORC-specific edge cases based on allium spec"
+    },
+    "verification": [
+      "All edge cases handled correctly",
+      "Conservative behavior verified"
+    ],
+    "status": "pending",
+    "depends_on": [14],
+    "priority": "P1"
+  },
+  {
+    "id": 26,
+    "phase": "Testing",
+    "task": "Add compound predicate tests (AND, OR, NOT)",
+    "description": "Test logical operators with statistics.",
+    "files_to_modify": [
+      "cpp/src/arrow/dataset/file_orc_test.cc"
+    ],
+    "parquet_reference": {
+      "notes": "Verify three-valued logic behavior"
+    },
+    "verification": [
+      "All compound predicate combinations work"
+    ],
+    "status": "pending",
+    "depends_on": [14],
+    "priority": "P1"
+  },
+  {
+    "id": 27,
+    "phase": "Testing",
+    "task": "Add IN predicate test",
+    "description": "Test IN predicate with range intersection.",
+    "files_to_modify": [
+      "cpp/src/arrow/dataset/file_orc_test.cc"
+    ],
+    "parquet_reference": {
+      "notes": "Test value set intersection with min/max"
+    },
+    "verification": [
+      "IN predicate optimized correctly"
+    ],
+    "status": "pending",
+    "depends_on": [14],
+    "priority": "P1"
+  },
+  {
+    "id": 28,
+    "phase": "Testing",
+    "task": "Add NULL handling tests",
+    "description": "Test IS NULL, IS VALID predicates. Verify three-valued logic.",
+    "files_to_modify": [
+      "cpp/src/arrow/dataset/file_orc_test.cc"
+    ],
+    "parquet_reference": {
+      "concept": "ScanWithPushdownNulls",
+      "notes": "Already exists but verify with statistics"
+    },
+    "verification": [
+      "NULL predicates work correctly"
+    ],
+    "status": "pending",
+    "depends_on": [14],
+    "priority": "P1"
+  },
+  {
+    "id": 29,
+    "phase": "Cache Management",
+    "task": "Implement ClearCachedMetadata",
+    "description": "Invalidate all cached data. Set cache_status to uncached. Useful for testing and error recovery.",
+    "files_to_modify": [
+      "cpp/src/arrow/dataset/file_orc.cc"
+    ],
+    "parquet_reference": {
+      "concept": "ClearCachedMetadata",
+      "file": "cpp/src/arrow/dataset/file_parquet.h",
+      "lines": "178",
+      "notes": "Same pattern"
+    },
+    "verification": [
+      "Unit test: Cache clearing",
+      "Unit test: Rebuild after clear"
+    ],
+    "status": "pending",
+    "depends_on": [13],
+    "priority": "P2"
+  },
+  {
+    "id": 30,
+    "phase": "Documentation",
+    "task": "Add inline documentation with spec references",
+    "description": "Document all new functions with references to allium spec sections. Explain design decisions.",
+    "files_to_modify": [
+      "cpp/src/arrow/dataset/file_orc.h",
+      "cpp/src/arrow/dataset/file_orc.cc"
+    ],
+    "parquet_reference": {
+      "notes": "Follow Parquet's documentation style"
+    },
+    "verification": [
+      "All public APIs documented",
+      "Spec references included"
+    ],
+    "status": "pending",
+    "depends_on": [14],
+    "priority": "P3"
+  },
+  {
+    "id": 31,
+    "phase": "Performance",
+    "task": "Add performance benchmarks",
+    "description": "Benchmark I/O reduction with selective filters. Measure cache benefit. Compare to baseline.",
+    "files_to_modify": [
+      "cpp/src/arrow/dataset/file_orc_benchmark.cc"
+    ],
+    "files_to_create": [
+      "cpp/src/arrow/dataset/file_orc_benchmark.cc"
+    ],
+    "parquet_reference": {
+      "notes": "Create ORC-specific benchmarks"
+    },
+    "verification": [
+      "Benchmarks run successfully",
+      "Performance improvement documented"
+    ],
+    "status": "pending",
+    "depends_on": [14],
+    "priority": "P2"
+  },
+  {
+    "id": 32,
+    "phase": "Future - Float Support",
+    "task": "Add float32/float64 type support",
+    "description": "Extend statistics support to floating-point types. Handle NaN, infinity, signed zero edge cases.",
+    "files_to_modify": [
+      "cpp/src/arrow/dataset/file_orc.cc"
+    ],
+    "parquet_reference": {
+      "notes": "See allium spec FLOATING-POINT EDGE CASES section"
+    },
+    "verification": [
+      "Float predicates work correctly",
+      "NaN handling verified"
+    ],
+    "status": "pending",
+    "depends_on": [14],
+    "priority": "P2"
+  },
+  {
+    "id": 33,
+    "phase": "Future - String Support",
+    "task": "Add string/binary type support",
+    "description": "Extend to string/binary types. Handle truncation in statistics.",
+    "files_to_modify": [
+      "cpp/src/arrow/dataset/file_orc.cc"
+    ],
+    "parquet_reference": {
+      "concept": "String column pushdown test",
+      "file": "cpp/src/arrow/dataset/file_parquet_test.cc",
+      "lines": "810",
+      "notes": "See allium spec TRUNCATION HANDLING section"
+    },
+    "verification": [
+      "String predicates work correctly",
+      "Truncation handled conservatively"
+    ],
+    "status": "pending",
+    "depends_on": [14],
+    "priority": "P2"
+  },
+  {
+    "id": 34,
+    "phase": "Future - Temporal Support",
+    "task": "Add timestamp/date type support",
+    "description": "Extend to temporal types. Handle unit conversion and timezone issues.",
+    "files_to_modify": [
+      "cpp/src/arrow/dataset/file_orc.cc"
+    ],
+    "parquet_reference": {
+      "concept": "Duration column pushdown test",
+      "file": "cpp/src/arrow/dataset/file_parquet_test.cc",
+      "lines": "827",
+      "notes": "Handle temporal type complexity"
+    },
+    "verification": [
+      "Temporal predicates work correctly",
+      "Unit conversion correct"
+    ],
+    "status": "pending",
+    "depends_on": [14],
+    "priority": "P2"
+  },
+  {
+    "id": 35,
+    "phase": "Future - Nested Types",
+    "task": "Add nested type tests",
+    "description": "Test predicate pushdown for struct/list/map columns via manifest.",
+    "files_to_modify": [
+      "cpp/src/arrow/dataset/file_orc_test.cc"
+    ],
+    "parquet_reference": {
+      "notes": "Verify manifest correctly maps nested fields to leaf columns"
+    },
+    "verification": [
+      "Nested field predicates work"
+    ],
+    "status": "pending",
+    "depends_on": [14],
+    "priority": "P2"
+  }
+]

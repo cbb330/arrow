@@ -813,6 +813,13 @@ else()
   )
 endif()
 
+if(DEFINED ENV{ARROW_WIL_URL})
+  set(ARROW_WIL_URL "$ENV{ARROW_WIL_URL}")
+else()
+  set_urls(ARROW_WIL_URL
+           "https://github.com/microsoft/wil/archive/${ARROW_WIL_BUILD_VERSION}.tar.gz")
+endif()
+
 if(DEFINED ENV{ARROW_XSIMD_URL})
   set(XSIMD_SOURCE_URL "$ENV{ARROW_XSIMD_URL}")
 else()
@@ -2343,13 +2350,6 @@ if(ARROW_MIMALLOC)
     set(MIMALLOC_C_FLAGS "${MIMALLOC_C_FLAGS} -DERROR_COMMITMENT_MINIMUM=635")
   endif()
 
-  set(MIMALLOC_PATCH_COMMAND "")
-  if(${UPPERCASE_BUILD_TYPE} STREQUAL "DEBUG")
-    find_program(PATCH patch REQUIRED)
-    set(MIMALLOC_PATCH_COMMAND ${PATCH} -p1 -i
-                               ${CMAKE_CURRENT_LIST_DIR}/mimalloc-1138.patch)
-  endif()
-
   set(MIMALLOC_CMAKE_ARGS
       ${EP_COMMON_CMAKE_ARGS}
       "-DCMAKE_C_FLAGS=${MIMALLOC_C_FLAGS}"
@@ -2367,7 +2367,6 @@ if(ARROW_MIMALLOC)
                       ${EP_COMMON_OPTIONS}
                       URL ${MIMALLOC_SOURCE_URL}
                       URL_HASH "SHA256=${ARROW_MIMALLOC_BUILD_SHA256_CHECKSUM}"
-                      PATCH_COMMAND ${MIMALLOC_PATCH_COMMAND}
                       CMAKE_ARGS ${MIMALLOC_CMAKE_ARGS}
                       BUILD_BYPRODUCTS "${MIMALLOC_STATIC_LIB}")
 
@@ -2650,7 +2649,7 @@ if(ARROW_USE_XSIMD)
                      IS_RUNTIME_DEPENDENCY
                      FALSE
                      REQUIRED_VERSION
-                     "13.0.0")
+                     "14.0.0")
 
   if(xsimd_SOURCE STREQUAL "BUNDLED")
     set(ARROW_XSIMD arrow::xsimd)
@@ -4060,6 +4059,21 @@ endif()
 
 function(build_azure_sdk)
   message(STATUS "Building Azure SDK for C++ from source")
+
+  # On Windows, Azure SDK's WinHTTP transport requires WIL (Windows Implementation Libraries).
+  # Fetch WIL before Azure SDK so the WIL::WIL target is available.
+  if(WIN32)
+    message(STATUS "Fetching WIL (Windows Implementation Libraries) for Azure SDK")
+    fetchcontent_declare(wil
+                         ${FC_DECLARE_COMMON_OPTIONS} OVERRIDE_FIND_PACKAGE
+                         URL ${ARROW_WIL_URL}
+                         URL_HASH "SHA256=${ARROW_WIL_BUILD_SHA256_CHECKSUM}")
+    prepare_fetchcontent()
+    set(WIL_BUILD_PACKAGING OFF)
+    set(WIL_BUILD_TESTS OFF)
+    fetchcontent_makeavailable(wil)
+  endif()
+
   fetchcontent_declare(azure_sdk
                        ${FC_DECLARE_COMMON_OPTIONS}
                        URL ${ARROW_AZURE_SDK_URL}

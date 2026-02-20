@@ -33,6 +33,7 @@
 #include "arrow/io/interfaces.h"
 #include "arrow/memory_pool.h"
 #include "arrow/record_batch.h"
+#include "arrow/scalar.h"
 #include "arrow/status.h"
 #include "arrow/table.h"
 #include "arrow/table_builder.h"
@@ -548,6 +549,92 @@ class ORCFileReader::Impl {
     return NextStripeReader(batch_size, empty_vec);
   }
 
+  Result<std::shared_ptr<OrcColumnStatistics>> GetColumnStatistics(int column_index) {
+    ORC_BEGIN_CATCH_NOT_OK;
+    const liborc::Statistics* file_stats = reader_->getStatistics();
+    if (!file_stats) {
+      return Status::IOError("No file statistics available");
+    }
+    return ConvertColumnStatistics(file_stats->getColumnStatistics(column_index));
+    ORC_END_CATCH_NOT_OK;
+  }
+
+  Result<std::shared_ptr<OrcColumnStatistics>> GetStripeColumnStatistics(
+      int64_t stripe_index, int column_index) {
+    ORC_BEGIN_CATCH_NOT_OK;
+    const liborc::Statistics* stripe_stats =
+        reader_->getStripeStatistics(static_cast<uint64_t>(stripe_index));
+    if (!stripe_stats) {
+      return Status::IOError("No stripe statistics available for stripe ",
+                             stripe_index);
+    }
+    return ConvertColumnStatistics(stripe_stats->getColumnStatistics(column_index));
+    ORC_END_CATCH_NOT_OK;
+  }
+
+  const void* GetORCType() {
+    return static_cast<const void*>(&reader_->getType());
+  }
+
+  Result<std::shared_ptr<OrcColumnStatistics>> ConvertColumnStatistics(
+      const liborc::ColumnStatistics* orc_stats) {
+    if (!orc_stats) {
+      return Status::IOError("Column statistics not available");
+    }
+
+    auto stats = std::make_shared<OrcColumnStatistics>();
+    stats->has_null = orc_stats->hasNull();
+    stats->num_values = orc_stats->getNumberOfValues();
+
+    // Try to extract min/max based on the column type
+    const liborc::IntegerColumnStatistics* int_stats =
+        dynamic_cast<const liborc::IntegerColumnStatistics*>(orc_stats);
+    if (int_stats) {
+      stats->has_minimum = int_stats->hasMinimum();
+      stats->has_maximum = int_stats->hasMaximum();
+      if (stats->has_minimum) {
+        stats->minimum = std::make_shared<Int64Scalar>(int_stats->getMinimum());
+      }
+      if (stats->has_maximum) {
+        stats->maximum = std::make_shared<Int64Scalar>(int_stats->getMaximum());
+      }
+      return stats;
+    }
+
+    const liborc::DoubleColumnStatistics* double_stats =
+        dynamic_cast<const liborc::DoubleColumnStatistics*>(orc_stats);
+    if (double_stats) {
+      stats->has_minimum = double_stats->hasMinimum();
+      stats->has_maximum = double_stats->hasMaximum();
+      if (stats->has_minimum) {
+        stats->minimum = std::make_shared<DoubleScalar>(double_stats->getMinimum());
+      }
+      if (stats->has_maximum) {
+        stats->maximum = std::make_shared<DoubleScalar>(double_stats->getMaximum());
+      }
+      return stats;
+    }
+
+    const liborc::StringColumnStatistics* string_stats =
+        dynamic_cast<const liborc::StringColumnStatistics*>(orc_stats);
+    if (string_stats) {
+      stats->has_minimum = string_stats->hasMinimum();
+      stats->has_maximum = string_stats->hasMaximum();
+      if (stats->has_minimum) {
+        stats->minimum = std::make_shared<StringScalar>(string_stats->getMinimum());
+      }
+      if (stats->has_maximum) {
+        stats->maximum = std::make_shared<StringScalar>(string_stats->getMaximum());
+      }
+      return stats;
+    }
+
+    // For other types, return statistics without min/max
+    stats->has_minimum = false;
+    stats->has_maximum = false;
+    return stats;
+  }
+
  private:
   MemoryPool* pool_;
   std::unique_ptr<liborc::Reader> reader_;
@@ -572,6 +659,18 @@ Result<std::unique_ptr<ORCFileReader>> ORCFileReader::Open(
 Result<std::shared_ptr<const KeyValueMetadata>> ORCFileReader::ReadMetadata() {
   return impl_->ReadMetadata();
 }
+
+Result<std::shared_ptr<OrcColumnStatistics>> ORCFileReader::GetColumnStatistics(
+    int column_index) {
+  return impl_->GetColumnStatistics(column_index);
+}
+
+Result<std::shared_ptr<OrcColumnStatistics>> ORCFileReader::GetStripeColumnStatistics(
+    int64_t stripe_index, int column_index) {
+  return impl_->GetStripeColumnStatistics(stripe_index, column_index);
+}
+
+const void* ORCFileReader::GetORCType() { return impl_->GetORCType(); }
 
 Result<std::shared_ptr<Schema>> ORCFileReader::ReadSchema() {
   return impl_->ReadSchema();

@@ -2451,12 +2451,12 @@ TEST(TestArrowReadWrite, ReadSingleRowGroup) {
 
   ASSERT_EQ(2, reader->num_row_groups());
 
-  std::shared_ptr<Table> r1, r2, r3, r4;
+  std::shared_ptr<Table> r2;
   // Read everything
-  ASSERT_OK_NO_THROW(reader->ReadRowGroup(0, &r1));
+  ASSERT_OK_AND_ASSIGN(auto r1, reader->ReadRowGroup(0));
   ASSERT_OK_NO_THROW(reader->RowGroup(1)->ReadTable(&r2));
-  ASSERT_OK_NO_THROW(reader->ReadRowGroups({0, 1}, &r3));
-  ASSERT_OK_NO_THROW(reader->ReadRowGroups({1}, &r4));
+  ASSERT_OK_AND_ASSIGN(auto r3, reader->ReadRowGroups({0, 1}));
+  ASSERT_OK_AND_ASSIGN(auto r4, reader->ReadRowGroups({1}));
 
   std::shared_ptr<Table> concatenated;
 
@@ -4085,7 +4085,7 @@ TEST_F(TestNestedSchemaRead, ReadTablePartial) {
   ASSERT_NO_FATAL_FAILURE(ValidateTableArrayTypes(*table));
 
   // columns: {group1.leaf1, leaf3}
-  ASSERT_OK_NO_THROW(reader_->ReadRowGroup(0, {0, 2}, &table));
+  ASSERT_OK_AND_ASSIGN(table, reader_->ReadRowGroup(0, {0, 2}));
   ASSERT_EQ(table->num_rows(), NUM_SIMPLE_TEST_ROWS);
   ASSERT_EQ(table->num_columns(), 2);
   ASSERT_EQ(table->schema()->field(0)->name(), "group1");
@@ -5887,6 +5887,35 @@ TEST(TestArrowReadWrite, OperationsOnClosedWriter) {
   ASSERT_OK_AND_ASSIGN(auto record_batch, table->CombineChunksToBatch());
   ASSERT_RAISES(Invalid, writer->WriteRecordBatch(*record_batch));
   ASSERT_RAISES(Invalid, writer->WriteTable(*table, 1));
+}
+
+TEST(TestArrowReadWrite, AllNulls) {
+  auto schema = ::arrow::schema({::arrow::field("all_nulls", ::arrow::int8())});
+
+  constexpr int64_t length = 3;
+  ASSERT_OK_AND_ASSIGN(auto null_bitmap, ::arrow::AllocateEmptyBitmap(length));
+  auto array_data = ::arrow::ArrayData::Make(
+      ::arrow::int8(), length, {null_bitmap, /*values=*/nullptr}, /*null_count=*/length);
+  auto array = ::arrow::MakeArray(array_data);
+  auto record_batch = ::arrow::RecordBatch::Make(schema, length, {array});
+
+  auto sink = CreateOutputStream();
+  ASSERT_OK_AND_ASSIGN(auto writer, parquet::arrow::FileWriter::Open(
+                                        *schema, ::arrow::default_memory_pool(), sink,
+                                        parquet::default_writer_properties(),
+                                        parquet::default_arrow_writer_properties()));
+  ASSERT_OK(writer->WriteRecordBatch(*record_batch));
+  ASSERT_OK(writer->Close());
+  ASSERT_OK_AND_ASSIGN(auto buffer, sink->Finish());
+
+  std::shared_ptr<::arrow::Table> read_table;
+  ASSERT_OK_AND_ASSIGN(auto reader,
+                       parquet::arrow::OpenFile(std::make_shared<BufferReader>(buffer),
+                                                ::arrow::default_memory_pool()));
+  ASSERT_OK(reader->ReadTable(&read_table));
+  auto expected_table = ::arrow::Table::Make(
+      schema, {::arrow::ArrayFromJSON(::arrow::int8(), R"([null, null, null])")});
+  ASSERT_TRUE(expected_table->Equals(*read_table));
 }
 
 }  // namespace arrow
