@@ -13,7 +13,7 @@
       "cmake --build . --target arrow_orc",
       "Unit test: GetStripeColumnStatistics returns valid statistics for int32/int64"
     ],
-    "status": "pending",
+    "status": "complete",
     "depends_on": [],
     "priority": "P0"
   },
