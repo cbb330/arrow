@@ -19,6 +19,7 @@
 
 #include <memory>
 #include <optional>
+#include <unordered_set>
 
 #include "arrow/adapters/orc/adapter.h"
 #include "arrow/compute/api_scalar.h"
@@ -372,6 +373,114 @@ Future<std::optional<int64_t>> OrcFileFormat::CountRows(
         ARROW_ASSIGN_OR_RAISE(auto reader, OpenORCReader(file->source()));
         return reader->NumberOfRows();
       }));
+}
+
+//
+// StripeStatisticsCache
+//
+
+struct StripeStatisticsCache {
+  std::vector<compute::Expression> stripe_guarantees;
+  std::unordered_set<std::string> fields_processed;
+  std::vector<bool> statistics_complete;
+};
+
+//
+// OrcFileFragment implementation
+//
+
+OrcFileFragment::OrcFileFragment(FileSource source, std::shared_ptr<FileFormat> format,
+                                 compute::Expression partition_expression,
+                                 std::shared_ptr<Schema> physical_schema,
+                                 std::optional<std::vector<int>> stripes)
+    : FileFragment(std::move(source), std::move(format), std::move(partition_expression),
+                   std::move(physical_schema)),
+      orc_format_(internal::checked_cast<OrcFileFormat&>(*format_)),
+      stripes_(std::move(stripes)) {}
+
+void* OrcFileFragment::metadata() {
+  auto lock = physical_schema_mutex_.Lock();
+  return orc_reader_;
+}
+
+Status OrcFileFragment::EnsureCompleteMetadata(void* reader) {
+  auto lock = physical_schema_mutex_.Lock();
+
+  if (cache_status_ == OrcCacheStatus::Cached) {
+    return Status::OK();
+  }
+
+  if (cache_status_ == OrcCacheStatus::Loading) {
+    return Status::Invalid("Metadata is currently being loaded by another thread");
+  }
+
+  cache_status_ = OrcCacheStatus::Loading;
+
+  if (reader == nullptr) {
+    ARROW_ASSIGN_OR_RAISE(auto orc_reader, OpenORCReader(source_));
+    orc_reader_ = orc_reader.release();
+  } else {
+    orc_reader_ = reader;
+  }
+
+  cache_status_ = OrcCacheStatus::Cached;
+  return Status::OK();
+}
+
+Status OrcFileFragment::ClearCachedMetadata() {
+  auto lock = physical_schema_mutex_.Lock();
+  orc_reader_ = nullptr;
+  manifest_ = nullptr;
+  statistics_cache_ = nullptr;
+  cache_status_ = OrcCacheStatus::Uncached;
+  return Status::OK();
+}
+
+Status OrcFileFragment::SetMetadata(void* reader,
+                                    std::shared_ptr<OrcSchemaManifest> manifest) {
+  auto lock = physical_schema_mutex_.Lock();
+  if (cache_status_ == OrcCacheStatus::Cached) {
+    return Status::OK();
+  }
+  orc_reader_ = reader;
+  manifest_ = std::move(manifest);
+  cache_status_ = OrcCacheStatus::Cached;
+  return Status::OK();
+}
+
+Result<std::shared_ptr<Fragment>> OrcFileFragment::Subset(
+    compute::Expression predicate) {
+  ARROW_ASSIGN_OR_RAISE(auto stripes, FilterStripes(std::move(predicate)));
+  return Subset(std::move(stripes));
+}
+
+Result<std::shared_ptr<Fragment>> OrcFileFragment::Subset(std::vector<int> stripe_ids) {
+  auto subset_fragment = std::shared_ptr<OrcFileFragment>(new OrcFileFragment(
+      source_, format_, partition_expression_, physical_schema_, std::move(stripe_ids)));
+  if (cache_status_ == OrcCacheStatus::Cached) {
+    ARROW_RETURN_NOT_OK(subset_fragment->SetMetadata(orc_reader_, manifest_));
+  }
+  return subset_fragment;
+}
+
+Result<FragmentVector> OrcFileFragment::SplitByStripe(compute::Expression predicate) {
+  ARROW_RETURN_NOT_OK(EnsureCompleteMetadata());
+  return Status::NotImplemented("SplitByStripe not yet implemented");
+}
+
+Result<std::vector<int>> OrcFileFragment::FilterStripes(compute::Expression predicate) {
+  ARROW_RETURN_NOT_OK(EnsureCompleteMetadata());
+  return Status::NotImplemented("FilterStripes not yet implemented");
+}
+
+Result<std::vector<compute::Expression>> OrcFileFragment::TestStripes(
+    compute::Expression predicate) {
+  return Status::NotImplemented("TestStripes not yet implemented");
+}
+
+Result<std::optional<int64_t>> OrcFileFragment::TryCountRows(
+    compute::Expression predicate) {
+  return std::nullopt;
 }
 
 // //
