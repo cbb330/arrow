@@ -185,9 +185,10 @@
       "Unit test: Cache initialization",
       "Unit test: Idempotency"
     ],
-    "status": "pending",
+    "status": "complete",
     "depends_on": [5],
-    "priority": "P0"
+    "priority": "P0",
+    "notes": "Implemented as part of Task #6 - EnsureCompleteMetadata() initializes statistics_cache_ with stripe_guarantees (literal(true) per stripe) and statistics_complete (all false). Idempotent via cache_status_ check."
   },
   {
     "id": 9,
