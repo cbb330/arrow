@@ -35,7 +35,7 @@
       "cmake --build . --target arrow_dataset",
       "Unit test: Manifest construction from ORC metadata"
     ],
-    "status": "pending",
+    "status": "complete",
     "depends_on": [0],
     "priority": "P0"
   },
