@@ -208,7 +208,7 @@
       "Unit test: Skipping unsupported types",
       "Unit test: Nested field resolution"
     ],
-    "status": "pending",
+    "status": "complete",
     "depends_on": [3, 7],
     "priority": "P0"
   },
