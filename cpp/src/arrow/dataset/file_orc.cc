@@ -35,6 +35,16 @@ using internal::checked_pointer_cast;
 
 namespace dataset {
 
+// OrcSchemaManifest implementation
+Status OrcSchemaManifest::Make(const std::shared_ptr<Schema>& schema,
+                                const void* orc_type, OrcSchemaManifest* manifest) {
+  // TODO(Task #2): Implement BuildOrcSchemaManifest logic
+  // This is a placeholder for Task #1 - actual implementation in Task #2
+  manifest->origin_schema = schema;
+  return Status::NotImplemented(
+      "OrcSchemaManifest::Make will be implemented in Task #2");
+}
+
 namespace {
 
 Result<std::unique_ptr<arrow::adapters::orc::ORCFileReader>> OpenORCReader(
