@@ -143,7 +143,7 @@
       "Unit test: Metadata loading",
       "Unit test: Caching (second call doesn't reload)"
     ],
-    "status": "pending",
+    "status": "complete",
     "depends_on": [4],
     "priority": "P0"
   },
@@ -164,9 +164,10 @@
       "Unit test: Manifest caching",
       "Unit test: Immutability once set"
     ],
-    "status": "pending",
+    "status": "complete",
     "depends_on": [2, 6],
-    "priority": "P0"
+    "priority": "P0",
+    "notes": "Implemented as part of Task #6 - EnsureCompleteMetadata() builds manifest using OrcSchemaManifest::Make() and stores in manifest_."
   },
   {
     "id": 8,
