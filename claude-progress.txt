@@ -279,3 +279,22 @@ With Tasks #0-#3 complete, these tasks are now unblocked:
 ## Session Completed Successfully ✨
 
 **Summary**: Highly productive session completing foundation for ORC predicate pushdown. Core data structures (schema manifest, column resolution, statistics APIs) are in place. Ready for fragment and filtering logic in next session.
+
+
+## Session 3 - 2026-02-20 (In Progress)
+
+### Session Summary
+**Context**: Fresh context window
+**Tasks Completed**: 5 tasks (Tasks #4-#8)  
+**PRs Merged**: 6 PRs
+**Status**: Very productive - fragment infrastructure complete
+
+### Tasks Completed
+- Task #4: OrcFileFragment class (+187 lines)
+- Task #5: StripeStatisticsCache (done in #4)
+- Task #6: EnsureCompleteMetadata (+62 lines) 
+- Task #7: EnsureManifestCached (done in #6)
+- Task #8: EnsureStatisticsCached (done in #6)
+
+### Next: Task #9 - ResolvePredicateFields (Predicate Evaluation phase)
+
