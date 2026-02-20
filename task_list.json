@@ -55,7 +55,7 @@
       "Unit test: Manifest building for flat schemas",
       "Unit test: Manifest building for nested schemas (struct, list, map)"
     ],
-    "status": "pending",
+    "status": "complete",
     "depends_on": [1],
     "priority": "P0"
   },
