@@ -205,6 +205,52 @@ Status CheckTimeZoneDatabaseAvailability() {
 }
 #endif
 
+// Recursively build OrcSchemaField tree by walking paired ORC and Arrow types
+Status BuildOrcSchemaFieldsRecursive(const liborc::Type* orc_type,
+                                     const std::shared_ptr<Field>& arrow_field,
+                                     OrcSchemaField* out_field) {
+  out_field->field = arrow_field;
+  out_field->orc_column_id = static_cast<int>(orc_type->getColumnId());
+
+  // For struct types, recursively build children
+  if (arrow_field->type()->id() == Type::STRUCT &&
+      orc_type->getKind() == liborc::STRUCT) {
+    const auto& struct_type = checked_cast<const StructType&>(*arrow_field->type());
+    size_t num_children = struct_type.num_fields();
+    out_field->children.resize(num_children);
+
+    for (size_t i = 0; i < num_children; ++i) {
+      const liborc::Type* orc_subtype = orc_type->getSubtype(i);
+      RETURN_NOT_OK(BuildOrcSchemaFieldsRecursive(
+          orc_subtype, struct_type.field(static_cast<int>(i)),
+          &out_field->children[i]));
+    }
+  }
+  // For list types, handle the child
+  else if (arrow_field->type()->id() == Type::LIST &&
+           orc_type->getKind() == liborc::LIST) {
+    const auto& list_type = checked_cast<const ListType&>(*arrow_field->type());
+    out_field->children.resize(1);
+    const liborc::Type* orc_subtype = orc_type->getSubtype(0);
+    RETURN_NOT_OK(BuildOrcSchemaFieldsRecursive(orc_subtype, list_type.value_field(),
+                                                &out_field->children[0]));
+  }
+  // For map types, handle key and value children
+  else if (arrow_field->type()->id() == Type::MAP &&
+           orc_type->getKind() == liborc::MAP) {
+    const auto& map_type = checked_cast<const MapType&>(*arrow_field->type());
+    out_field->children.resize(2);
+    const liborc::Type* key_type = orc_type->getSubtype(0);
+    const liborc::Type* value_type = orc_type->getSubtype(1);
+    RETURN_NOT_OK(BuildOrcSchemaFieldsRecursive(key_type, map_type.key_field(),
+                                                &out_field->children[0]));
+    RETURN_NOT_OK(BuildOrcSchemaFieldsRecursive(value_type, map_type.item_field(),
+                                                &out_field->children[1]));
+  }
+
+  return Status::OK();
+}
+
 }  // namespace
 
 class ORCFileReader::Impl {
@@ -644,7 +690,34 @@ class ORCFileReader::Impl {
     ORC_END_CATCH_NOT_OK
   }
 
-  const liborc::Type& GetORCType() { return reader_->getType(); }
+  Result<std::shared_ptr<OrcSchemaManifest>> BuildSchemaManifest(
+      const std::shared_ptr<Schema>& arrow_schema) {
+    auto manifest = std::make_shared<OrcSchemaManifest>();
+
+    const liborc::Type& orc_root_type = reader_->getType();
+
+    if (orc_root_type.getKind() != liborc::STRUCT) {
+      return Status::Invalid("ORC root type must be STRUCT");
+    }
+
+    size_t num_fields = arrow_schema->num_fields();
+    if (num_fields != orc_root_type.getSubtypeCount()) {
+      return Status::Invalid("Arrow schema field count (", num_fields,
+                             ") does not match ORC type subtype count (",
+                             orc_root_type.getSubtypeCount(), ")");
+    }
+
+    manifest->schema_fields.resize(num_fields);
+
+    for (size_t i = 0; i < num_fields; ++i) {
+      const liborc::Type* orc_subtype = orc_root_type.getSubtype(i);
+      RETURN_NOT_OK(BuildOrcSchemaFieldsRecursive(
+          orc_subtype, arrow_schema->field(static_cast<int>(i)),
+          &manifest->schema_fields[i]));
+    }
+
+    return manifest;
+  }
 
  private:
   MemoryPool* pool_;
@@ -801,7 +874,10 @@ Result<std::vector<Statistics>> ORCFileReader::GetStripeStatistics(
   return impl_->GetStripeStatistics(stripe_index, column_indices);
 }
 
-const ::orc::Type& ORCFileReader::GetORCType() { return impl_->GetORCType(); }
+Result<std::shared_ptr<OrcSchemaManifest>> ORCFileReader::BuildSchemaManifest(
+    const std::shared_ptr<Schema>& arrow_schema) const {
+  return impl_->BuildSchemaManifest(arrow_schema);
+}
 
 namespace {
 

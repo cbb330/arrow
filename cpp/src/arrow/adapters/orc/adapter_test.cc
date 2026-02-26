@@ -1712,10 +1712,13 @@ TEST(TestAdapterRead, ReadStripesEmptyVector) {
   EXPECT_EQ(table->schema()->field(0)->name(), "col1");
 }
 
-TEST(TestAdapterRead, GetORCType) {
+TEST(TestOrcSchemaManifest, FlatSchema) {
+  // Test case 1: Flat schema with primitive types
+  // Verify each top-level field maps to correct ORC column ID
+  // ORC column 0 is the root struct, so field 0 -> col 1, field 1 -> col 2, etc.
   MemoryOutputStream mem_stream(kDefaultMemStreamSize);
-  std::unique_ptr<liborc::Type> type(liborc::Type::buildTypeFromString(
-      "struct<col1:int,col2:bigint,col3:string>"));
+  std::unique_ptr<liborc::Type> type(
+      liborc::Type::buildTypeFromString("struct<col1:int,col2:bigint,col3:string>"));
 
   constexpr uint64_t stripe_size = 1024;
   constexpr uint64_t row_count = 10;
@@ -1737,25 +1740,263 @@ TEST(TestAdapterRead, GetORCType) {
 
   ASSERT_OK_AND_ASSIGN(auto reader,
                        adapters::orc::ORCFileReader::Open(in_stream, default_memory_pool()));
+  ASSERT_OK_AND_ASSIGN(auto arrow_schema, reader->ReadSchema());
 
-  // Get the ORC type — returns a reference, no cast needed
-  const liborc::Type& orc_type = reader->GetORCType();
+  // Build the manifest
+  ASSERT_OK_AND_ASSIGN(auto manifest, reader->BuildSchemaManifest(arrow_schema));
 
-  // Root should be STRUCT
-  EXPECT_EQ(orc_type.getKind(), liborc::STRUCT);
+  // Verify manifest field count matches Arrow schema field count
+  EXPECT_EQ(manifest->schema_fields.size(), arrow_schema->num_fields());
+  EXPECT_EQ(manifest->schema_fields.size(), 3);
 
-  // Should have 3 subtypes (col1, col2, col3)
-  EXPECT_EQ(orc_type.getSubtypeCount(), 3);
+  // Field 0 ("col1") should map to ORC column 1
+  EXPECT_EQ(manifest->schema_fields[0].field->name(), "col1");
+  EXPECT_EQ(manifest->schema_fields[0].orc_column_id, 1);
+  EXPECT_TRUE(manifest->schema_fields[0].is_leaf());
 
-  // Verify field names
-  EXPECT_EQ(orc_type.getFieldName(0), "col1");
-  EXPECT_EQ(orc_type.getFieldName(1), "col2");
-  EXPECT_EQ(orc_type.getFieldName(2), "col3");
+  // Field 1 ("col2") should map to ORC column 2
+  EXPECT_EQ(manifest->schema_fields[1].field->name(), "col2");
+  EXPECT_EQ(manifest->schema_fields[1].orc_column_id, 2);
+  EXPECT_TRUE(manifest->schema_fields[1].is_leaf());
 
-  // Verify field types
-  EXPECT_EQ(orc_type.getSubtype(0)->getKind(), liborc::INT);
-  EXPECT_EQ(orc_type.getSubtype(1)->getKind(), liborc::LONG);
-  EXPECT_EQ(orc_type.getSubtype(2)->getKind(), liborc::STRING);
+  // Field 2 ("col3") should map to ORC column 3
+  EXPECT_EQ(manifest->schema_fields[2].field->name(), "col3");
+  EXPECT_EQ(manifest->schema_fields[2].orc_column_id, 3);
+  EXPECT_TRUE(manifest->schema_fields[2].is_leaf());
+}
+
+TEST(TestOrcSchemaManifest, NestedStruct) {
+  // Test case 2: Nested schema with struct
+  // Verify nested fields have correct column IDs following depth-first pre-order
+  MemoryOutputStream mem_stream(kDefaultMemStreamSize);
+  std::unique_ptr<liborc::Type> type(liborc::Type::buildTypeFromString(
+      "struct<a:int,b:struct<c:bigint,d:string>,e:double>"));
+
+  constexpr uint64_t stripe_size = 1024;
+  constexpr uint64_t row_count = 10;
+
+  auto writer = CreateWriter(stripe_size, *type, &mem_stream);
+  auto batch = writer->createRowBatch(row_count);
+  auto struct_batch = internal::checked_cast<liborc::StructVectorBatch*>(batch.get());
+
+  struct_batch->numElements = row_count;
+  for (size_t i = 0; i < struct_batch->fields.size(); ++i) {
+    struct_batch->fields[i]->numElements = row_count;
+    if (i == 1) {
+      // Nested struct field
+      auto nested =
+          internal::checked_cast<liborc::StructVectorBatch*>(struct_batch->fields[i]);
+      for (size_t j = 0; j < nested->fields.size(); ++j) {
+        nested->fields[j]->numElements = row_count;
+      }
+    }
+  }
+  writer->add(*batch);
+  writer->close();
+
+  std::shared_ptr<io::RandomAccessFile> in_stream(new io::BufferReader(
+      std::make_shared<Buffer>(reinterpret_cast<const uint8_t*>(mem_stream.getData()),
+                               static_cast<int64_t>(mem_stream.getLength()))));
+
+  ASSERT_OK_AND_ASSIGN(auto reader,
+                       adapters::orc::ORCFileReader::Open(in_stream, default_memory_pool()));
+  ASSERT_OK_AND_ASSIGN(auto arrow_schema, reader->ReadSchema());
+
+  // Build the manifest
+  ASSERT_OK_AND_ASSIGN(auto manifest, reader->BuildSchemaManifest(arrow_schema));
+
+  // ORC depth-first pre-order column numbering:
+  // col 0: STRUCT (root)
+  // col 1: INT (a)
+  // col 2: STRUCT (b)
+  // col 3: BIGINT (c - child of b)
+  // col 4: STRING (d - child of b)
+  // col 5: DOUBLE (e)
+
+  EXPECT_EQ(manifest->schema_fields.size(), 3);
+
+  // Field 0: "a" -> column 1, is_leaf = true
+  EXPECT_EQ(manifest->schema_fields[0].field->name(), "a");
+  EXPECT_EQ(manifest->schema_fields[0].orc_column_id, 1);
+  EXPECT_TRUE(manifest->schema_fields[0].is_leaf());
+
+  // Field 1: "b" -> column 2, is_leaf = false (has children)
+  EXPECT_EQ(manifest->schema_fields[1].field->name(), "b");
+  EXPECT_EQ(manifest->schema_fields[1].orc_column_id, 2);
+  EXPECT_FALSE(manifest->schema_fields[1].is_leaf());
+  EXPECT_EQ(manifest->schema_fields[1].children.size(), 2);
+
+  // Field 1.0: "c" (child of "b") -> column 3
+  EXPECT_EQ(manifest->schema_fields[1].children[0].field->name(), "c");
+  EXPECT_EQ(manifest->schema_fields[1].children[0].orc_column_id, 3);
+  EXPECT_TRUE(manifest->schema_fields[1].children[0].is_leaf());
+
+  // Field 1.1: "d" (child of "b") -> column 4
+  EXPECT_EQ(manifest->schema_fields[1].children[1].field->name(), "d");
+  EXPECT_EQ(manifest->schema_fields[1].children[1].orc_column_id, 4);
+  EXPECT_TRUE(manifest->schema_fields[1].children[1].is_leaf());
+
+  // Field 2: "e" -> column 5, is_leaf = true
+  EXPECT_EQ(manifest->schema_fields[2].field->name(), "e");
+  EXPECT_EQ(manifest->schema_fields[2].orc_column_id, 5);
+  EXPECT_TRUE(manifest->schema_fields[2].is_leaf());
+}
+
+TEST(TestOrcSchemaManifest, GetFieldValidPath) {
+  // Test case 3: GetField with valid path returns correct OrcSchemaField
+  MemoryOutputStream mem_stream(kDefaultMemStreamSize);
+  std::unique_ptr<liborc::Type> type(liborc::Type::buildTypeFromString(
+      "struct<a:int,b:struct<c:bigint,d:string>>"));
+
+  constexpr uint64_t stripe_size = 1024;
+  constexpr uint64_t row_count = 10;
+
+  auto writer = CreateWriter(stripe_size, *type, &mem_stream);
+  auto batch = writer->createRowBatch(row_count);
+  auto struct_batch = internal::checked_cast<liborc::StructVectorBatch*>(batch.get());
+
+  struct_batch->numElements = row_count;
+  for (size_t i = 0; i < struct_batch->fields.size(); ++i) {
+    struct_batch->fields[i]->numElements = row_count;
+    if (i == 1) {
+      auto nested =
+          internal::checked_cast<liborc::StructVectorBatch*>(struct_batch->fields[i]);
+      for (size_t j = 0; j < nested->fields.size(); ++j) {
+        nested->fields[j]->numElements = row_count;
+      }
+    }
+  }
+  writer->add(*batch);
+  writer->close();
+
+  std::shared_ptr<io::RandomAccessFile> in_stream(new io::BufferReader(
+      std::make_shared<Buffer>(reinterpret_cast<const uint8_t*>(mem_stream.getData()),
+                               static_cast<int64_t>(mem_stream.getLength()))));
+
+  ASSERT_OK_AND_ASSIGN(auto reader,
+                       adapters::orc::ORCFileReader::Open(in_stream, default_memory_pool()));
+  ASSERT_OK_AND_ASSIGN(auto arrow_schema, reader->ReadSchema());
+
+  ASSERT_OK_AND_ASSIGN(auto manifest, reader->BuildSchemaManifest(arrow_schema));
+
+  // Test GetField with valid paths
+  // Path {0} -> field "a"
+  const auto* field_a = manifest->GetField({0});
+  ASSERT_NE(field_a, nullptr);
+  EXPECT_EQ(field_a->field->name(), "a");
+  EXPECT_EQ(field_a->orc_column_id, 1);
+
+  // Path {1} -> field "b"
+  const auto* field_b = manifest->GetField({1});
+  ASSERT_NE(field_b, nullptr);
+  EXPECT_EQ(field_b->field->name(), "b");
+  EXPECT_EQ(field_b->orc_column_id, 2);
+
+  // Path {1, 0} -> field "c" (b.c)
+  const auto* field_c = manifest->GetField({1, 0});
+  ASSERT_NE(field_c, nullptr);
+  EXPECT_EQ(field_c->field->name(), "c");
+  EXPECT_EQ(field_c->orc_column_id, 3);
+
+  // Path {1, 1} -> field "d" (b.d)
+  const auto* field_d = manifest->GetField({1, 1});
+  ASSERT_NE(field_d, nullptr);
+  EXPECT_EQ(field_d->field->name(), "d");
+  EXPECT_EQ(field_d->orc_column_id, 4);
+}
+
+TEST(TestOrcSchemaManifest, GetFieldInvalidPath) {
+  // Test case 4: GetField with invalid path returns nullptr
+  MemoryOutputStream mem_stream(kDefaultMemStreamSize);
+  std::unique_ptr<liborc::Type> type(
+      liborc::Type::buildTypeFromString("struct<col1:int,col2:bigint>"));
+
+  constexpr uint64_t stripe_size = 1024;
+  constexpr uint64_t row_count = 10;
+
+  auto writer = CreateWriter(stripe_size, *type, &mem_stream);
+  auto batch = writer->createRowBatch(row_count);
+  auto struct_batch = internal::checked_cast<liborc::StructVectorBatch*>(batch.get());
+
+  struct_batch->numElements = row_count;
+  for (size_t i = 0; i < struct_batch->fields.size(); ++i) {
+    struct_batch->fields[i]->numElements = row_count;
+  }
+  writer->add(*batch);
+  writer->close();
+
+  std::shared_ptr<io::RandomAccessFile> in_stream(new io::BufferReader(
+      std::make_shared<Buffer>(reinterpret_cast<const uint8_t*>(mem_stream.getData()),
+                               static_cast<int64_t>(mem_stream.getLength()))));
+
+  ASSERT_OK_AND_ASSIGN(auto reader,
+                       adapters::orc::ORCFileReader::Open(in_stream, default_memory_pool()));
+  ASSERT_OK_AND_ASSIGN(auto arrow_schema, reader->ReadSchema());
+
+  ASSERT_OK_AND_ASSIGN(auto manifest, reader->BuildSchemaManifest(arrow_schema));
+
+  // Test GetField with invalid paths
+  // Empty path -> nullptr
+  EXPECT_EQ(manifest->GetField({}), nullptr);
+
+  // Out of range index -> nullptr
+  EXPECT_EQ(manifest->GetField({2}), nullptr);
+  EXPECT_EQ(manifest->GetField({3}), nullptr);
+
+  // Negative index -> nullptr
+  EXPECT_EQ(manifest->GetField({-1}), nullptr);
+
+  // Path with extra depth (col1 is a leaf, has no children) -> nullptr
+  EXPECT_EQ(manifest->GetField({0, 0}), nullptr);
+}
+
+TEST(TestOrcSchemaManifest, IsLeafForListAndMap) {
+  // Test case 5 extension: is_leaf() for list and map types
+  // List and map types have children, so is_leaf() should return false
+  MemoryOutputStream mem_stream(kDefaultMemStreamSize);
+  std::unique_ptr<liborc::Type> type(liborc::Type::buildTypeFromString(
+      "struct<a:array<int>,b:map<string,bigint>,c:int>"));
+
+  constexpr uint64_t stripe_size = 1024;
+  constexpr uint64_t row_count = 10;
+
+  auto writer = CreateWriter(stripe_size, *type, &mem_stream);
+  auto batch = writer->createRowBatch(row_count);
+  auto struct_batch = internal::checked_cast<liborc::StructVectorBatch*>(batch.get());
+
+  struct_batch->numElements = row_count;
+  for (size_t i = 0; i < struct_batch->fields.size(); ++i) {
+    struct_batch->fields[i]->numElements = row_count;
+  }
+  writer->add(*batch);
+  writer->close();
+
+  std::shared_ptr<io::RandomAccessFile> in_stream(new io::BufferReader(
+      std::make_shared<Buffer>(reinterpret_cast<const uint8_t*>(mem_stream.getData()),
+                               static_cast<int64_t>(mem_stream.getLength()))));
+
+  ASSERT_OK_AND_ASSIGN(auto reader,
+                       adapters::orc::ORCFileReader::Open(in_stream, default_memory_pool()));
+  ASSERT_OK_AND_ASSIGN(auto arrow_schema, reader->ReadSchema());
+
+  ASSERT_OK_AND_ASSIGN(auto manifest, reader->BuildSchemaManifest(arrow_schema));
+
+  EXPECT_EQ(manifest->schema_fields.size(), 3);
+
+  // Field 0: list/array -> is_leaf = false (has element child)
+  EXPECT_EQ(manifest->schema_fields[0].field->name(), "a");
+  EXPECT_FALSE(manifest->schema_fields[0].is_leaf());
+  EXPECT_EQ(manifest->schema_fields[0].children.size(), 1);
+
+  // Field 1: map -> is_leaf = false (has key and value children)
+  EXPECT_EQ(manifest->schema_fields[1].field->name(), "b");
+  EXPECT_FALSE(manifest->schema_fields[1].is_leaf());
+  EXPECT_EQ(manifest->schema_fields[1].children.size(), 2);
+
+  // Field 2: int -> is_leaf = true
+  EXPECT_EQ(manifest->schema_fields[2].field->name(), "c");
+  EXPECT_TRUE(manifest->schema_fields[2].is_leaf());
+  EXPECT_EQ(manifest->schema_fields[2].children.size(), 0);
 }
 
 TEST(TestAdapterRead, GetColumnStatisticsDoubleNaN) {

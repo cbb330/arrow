@@ -31,14 +31,12 @@
 #include "arrow/util/macros.h"
 #include "arrow/util/visibility.h"
 
-namespace orc {
-class Type;
-}  // namespace orc
-
 namespace arrow {
 namespace adapters {
 namespace orc {
 
+// Forward declarations
+struct OrcSchemaManifest;
 /// \brief Information about an ORC stripe
 struct StripeInformation {
   /// \brief Offset of the stripe from the start of the file, in bytes
@@ -318,15 +316,17 @@ class ARROW_EXPORT ORCFileReader {
   Result<std::vector<Statistics>> GetStripeStatistics(int64_t stripe_index,
                                                       const std::vector<int>& column_indices);
 
-  /// \brief Get the ORC type tree for column ID mapping.
+  /// \brief Build a schema manifest mapping Arrow fields to ORC column IDs.
   ///
-  /// This is needed for building schema manifests that map Arrow schema fields
-  /// to ORC physical column indices. The ORC type tree uses depth-first pre-order
-  /// numbering where column 0 is the root struct, column 1 is the first top-level
-  /// field, etc.
+  /// Walks the ORC type tree paired with the Arrow schema to build a mapping
+  /// from Arrow field paths to ORC physical column indices, which are needed
+  /// for statistics lookup. ORC uses depth-first pre-order numbering where
+  /// column 0 is the root struct.
   ///
-  /// \return reference to the root ORC Type (STRUCT), owned by the reader.
-  const ::orc::Type& GetORCType();
+  /// \param[in] arrow_schema the Arrow schema (from ReadSchema())
+  /// \return the built manifest or an error
+  Result<std::shared_ptr<OrcSchemaManifest>> BuildSchemaManifest(
+      const std::shared_ptr<Schema>& arrow_schema) const;
 
  private:
   class Impl;
