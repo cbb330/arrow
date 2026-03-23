@@ -383,7 +383,7 @@ std::optional<compute::Expression> OrcFileFragment::EvaluateStatisticsAsExpressi
   auto bounds_expr = compute::and_(min_expr, max_expr);
 
   // If the column has nulls, include is_null in the expression
-  if (statistics.has_null()) {
+  if (scalar_stats.has_null) {
     return compute::or_(compute::is_null(field_expr), bounds_expr);
   }
 

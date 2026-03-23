@@ -34,6 +34,7 @@ namespace arrow {
 
 namespace adapters {
 namespace orc {
+struct OrcColumnStatisticsAsScalars;
 struct OrcSchemaManifest;
 class Statistics;
 class ORCFileReader;
