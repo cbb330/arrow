@@ -34,8 +34,8 @@ namespace arrow {
 
 namespace adapters {
 namespace orc {
-struct OrcColumnStatistics;
 struct OrcSchemaManifest;
+class Statistics;
 class ORCFileReader;
 }  // namespace orc
 }  // namespace adapters
@@ -123,7 +123,10 @@ class ARROW_DS_EXPORT OrcFileFragment : public FileFragment {
   /// \return expression representing statistics bounds, or nullopt if not available
   static std::optional<compute::Expression> EvaluateStatisticsAsExpression(
       const Field& field, const FieldRef& field_ref,
-      const adapters::orc::OrcColumnStatistics& statistics);
+      const adapters::orc::Statistics& statistics);
+  static std::optional<compute::Expression> EvaluateStatisticsAsExpression(
+      const Field& field, const FieldRef& field_ref,
+      const adapters::orc::OrcColumnStatisticsAsScalars& statistics);
 
  private:
   OrcFileFragment(FileSource source, std::shared_ptr<FileFormat> format,

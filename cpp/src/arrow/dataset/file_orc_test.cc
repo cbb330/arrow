@@ -200,7 +200,7 @@ INSTANTIATE_TEST_SUITE_P(TestScan, TestOrcFileFormatScan,
 
 // Test statistics expression evaluation
 TEST(TestOrcStatistics, EvaluateStatisticsAsExpression) {
-  using adapters::orc::OrcColumnStatistics;
+  using adapters::orc::OrcColumnStatisticsAsScalars;
 
   auto field_i64 = field("i64", int64());
   auto field_f64 = field("f64", float64());
@@ -209,7 +209,7 @@ TEST(TestOrcStatistics, EvaluateStatisticsAsExpression) {
 
   // Test with valid min/max statistics
   {
-    OrcColumnStatistics stats;
+    OrcColumnStatisticsAsScalars stats;
     stats.has_min_max = true;
     stats.has_null = false;
     stats.num_values = 100;
@@ -225,7 +225,7 @@ TEST(TestOrcStatistics, EvaluateStatisticsAsExpression) {
 
   // Test with has_null = true
   {
-    OrcColumnStatistics stats;
+    OrcColumnStatisticsAsScalars stats;
     stats.has_min_max = true;
     stats.has_null = true;
     stats.num_values = 100;
@@ -240,7 +240,7 @@ TEST(TestOrcStatistics, EvaluateStatisticsAsExpression) {
 
   // Test with no min/max statistics
   {
-    OrcColumnStatistics stats;
+    OrcColumnStatisticsAsScalars stats;
     stats.has_min_max = false;
     stats.has_null = false;
     stats.num_values = 100;
@@ -251,7 +251,7 @@ TEST(TestOrcStatistics, EvaluateStatisticsAsExpression) {
 
   // Test with null min or max
   {
-    OrcColumnStatistics stats;
+    OrcColumnStatisticsAsScalars stats;
     stats.has_min_max = true;
     stats.has_null = false;
     stats.num_values = 100;
@@ -264,7 +264,7 @@ TEST(TestOrcStatistics, EvaluateStatisticsAsExpression) {
 
   // Test with NaN values for float (both NaN)
   {
-    OrcColumnStatistics stats;
+    OrcColumnStatisticsAsScalars stats;
     stats.has_min_max = true;
     stats.has_null = false;
     stats.num_values = 100;
@@ -277,7 +277,7 @@ TEST(TestOrcStatistics, EvaluateStatisticsAsExpression) {
 
   // Test with NaN min but valid max
   {
-    OrcColumnStatistics stats;
+    OrcColumnStatisticsAsScalars stats;
     stats.has_min_max = true;
     stats.has_null = false;
     stats.num_values = 100;
@@ -292,7 +292,7 @@ TEST(TestOrcStatistics, EvaluateStatisticsAsExpression) {
 
   // Test with valid min but NaN max
   {
-    OrcColumnStatistics stats;
+    OrcColumnStatisticsAsScalars stats;
     stats.has_min_max = true;
     stats.has_null = false;
     stats.num_values = 100;

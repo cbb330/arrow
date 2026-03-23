@@ -302,13 +302,24 @@ Status OrcFileFragment::EnsureCompleteMetadata(
 
 std::optional<compute::Expression> OrcFileFragment::EvaluateStatisticsAsExpression(
     const Field& field, const FieldRef& field_ref,
-    const adapters::orc::OrcColumnStatistics& statistics) {
-  if (!statistics.has_min_max) {
+    const adapters::orc::Statistics& statistics) {
+  auto maybe_scalar_stats = adapters::orc::OrcStatisticsAsScalars(statistics);
+  if (!maybe_scalar_stats.ok()) {
+    return std::nullopt;
+  }
+  return EvaluateStatisticsAsExpression(field, field_ref,
+                                        std::move(maybe_scalar_stats).ValueUnsafe());
+}
+
+std::optional<compute::Expression> OrcFileFragment::EvaluateStatisticsAsExpression(
+    const Field& field, const FieldRef& field_ref,
+    const adapters::orc::OrcColumnStatisticsAsScalars& scalar_stats) {
+  if (!scalar_stats.has_min_max) {
     return std::nullopt;
   }
 
   // Both min and max must be valid
-  if (!statistics.min || !statistics.max) {
+  if (!scalar_stats.min || !scalar_stats.max) {
     return std::nullopt;
   }
 
@@ -317,15 +328,15 @@ std::optional<compute::Expression> OrcFileFragment::EvaluateStatisticsAsExpressi
     bool min_is_nan = false;
     bool max_is_nan = false;
 
-    if (statistics.min->is_valid) {
+    if (scalar_stats.min->is_valid) {
       switch (field.type()->id()) {
         case Type::FLOAT: {
-          auto val = checked_cast<const FloatScalar&>(*statistics.min).value;
+          auto val = checked_cast<const FloatScalar&>(*scalar_stats.min).value;
           min_is_nan = std::isnan(val);
           break;
         }
         case Type::DOUBLE: {
-          auto val = checked_cast<const DoubleScalar&>(*statistics.min).value;
+          auto val = checked_cast<const DoubleScalar&>(*scalar_stats.min).value;
           min_is_nan = std::isnan(val);
           break;
         }
@@ -334,15 +345,15 @@ std::optional<compute::Expression> OrcFileFragment::EvaluateStatisticsAsExpressi
       }
     }
 
-    if (statistics.max->is_valid) {
+    if (scalar_stats.max->is_valid) {
       switch (field.type()->id()) {
         case Type::FLOAT: {
-          auto val = checked_cast<const FloatScalar&>(*statistics.max).value;
+          auto val = checked_cast<const FloatScalar&>(*scalar_stats.max).value;
           max_is_nan = std::isnan(val);
           break;
         }
         case Type::DOUBLE: {
-          auto val = checked_cast<const DoubleScalar&>(*statistics.max).value;
+          auto val = checked_cast<const DoubleScalar&>(*scalar_stats.max).value;
           max_is_nan = std::isnan(val);
           break;
         }
@@ -361,18 +372,18 @@ std::optional<compute::Expression> OrcFileFragment::EvaluateStatisticsAsExpressi
   compute::Expression min_expr = compute::literal(true);
   compute::Expression max_expr = compute::literal(true);
 
-  if (statistics.min->is_valid) {
-    min_expr = compute::greater_equal(field_expr, compute::literal(statistics.min));
+  if (scalar_stats.min->is_valid) {
+    min_expr = compute::greater_equal(field_expr, compute::literal(scalar_stats.min));
   }
 
-  if (statistics.max->is_valid) {
-    max_expr = compute::less_equal(field_expr, compute::literal(statistics.max));
+  if (scalar_stats.max->is_valid) {
+    max_expr = compute::less_equal(field_expr, compute::literal(scalar_stats.max));
   }
 
   auto bounds_expr = compute::and_(min_expr, max_expr);
 
   // If the column has nulls, include is_null in the expression
-  if (statistics.has_null) {
+  if (statistics.has_null()) {
     return compute::or_(compute::is_null(field_expr), bounds_expr);
   }
 
