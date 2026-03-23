@@ -22,14 +22,18 @@
 #include <vector>
 
 #include "arrow/adapters/orc/options.h"
+#include "arrow/adapters/orc/statistics.h"
 #include "arrow/io/interfaces.h"
 #include "arrow/memory_pool.h"
 #include "arrow/record_batch.h"
 #include "arrow/status.h"
-#include "arrow/type.h"
 #include "arrow/type_fwd.h"
 #include "arrow/util/macros.h"
 #include "arrow/util/visibility.h"
+
+namespace orc {
+class Type;
+}  // namespace orc
 
 namespace arrow {
 namespace adapters {
@@ -128,6 +132,29 @@ class ARROW_EXPORT ORCFileReader {
   /// \return the returned RecordBatch
   Result<std::shared_ptr<RecordBatch>> ReadStripe(
       int64_t stripe, const std::vector<std::string>& include_names);
+
+  /// \brief Read multiple selected stripes as a Table
+  ///
+  /// Reads only the specified stripes and concatenates them into a single table.
+  /// This is useful for stripe-selective reading based on predicate pushdown.
+  /// If stripe_indices is empty, returns an empty table with the file's schema.
+  ///
+  /// \param[in] stripe_indices the indices of stripes to read
+  /// \return the returned Table containing data from the selected stripes
+  Result<std::shared_ptr<Table>> ReadStripes(
+      const std::vector<int64_t>& stripe_indices);
+
+  /// \brief Read multiple selected stripes with column selection as a Table
+  ///
+  /// Reads only the specified stripes and selected columns, concatenating them
+  /// into a single table.
+  /// If stripe_indices is empty, returns an empty table with the selected schema.
+  ///
+  /// \param[in] stripe_indices the indices of stripes to read
+  /// \param[in] include_indices the selected field indices to read
+  /// \return the returned Table containing data from the selected stripes and columns
+  Result<std::shared_ptr<Table>> ReadStripes(const std::vector<int64_t>& stripe_indices,
+                                              const std::vector<int>& include_indices);
 
   /// \brief Seek to designated row. Invoke NextStripeReader() after seek
   ///        will return stripe reader starting from designated row.
@@ -266,6 +293,40 @@ class ARROW_EXPORT ORCFileReader {
   ///
   /// \return A KeyValueMetadata object containing the ORC metadata
   Result<std::shared_ptr<const KeyValueMetadata>> ReadMetadata();
+
+  /// \brief Get file-level statistics for a column.
+  ///
+  /// \param[in] column_index the column index (0-based)
+  /// \return the column statistics
+  Result<Statistics> GetColumnStatistics(int column_index);
+
+  /// \brief Get stripe-level statistics for a column.
+  ///
+  /// \param[in] stripe_index the stripe index (0-based)
+  /// \param[in] column_index the column index (0-based)
+  /// \return the column statistics for the specified stripe
+  Result<Statistics> GetStripeColumnStatistics(int64_t stripe_index, int column_index);
+
+  /// \brief Get stripe-level statistics for multiple columns at once.
+  ///
+  /// More efficient than calling GetStripeColumnStatistics() in a loop
+  /// because it parses the stripe's statistics object only once.
+  ///
+  /// \param[in] stripe_index the stripe index (0-based)
+  /// \param[in] column_indices the column indices to retrieve statistics for
+  /// \return vector of column statistics, one per requested column index
+  Result<std::vector<Statistics>> GetStripeStatistics(int64_t stripe_index,
+                                                      const std::vector<int>& column_indices);
+
+  /// \brief Get the ORC type tree for column ID mapping.
+  ///
+  /// This is needed for building schema manifests that map Arrow schema fields
+  /// to ORC physical column indices. The ORC type tree uses depth-first pre-order
+  /// numbering where column 0 is the root struct, column 1 is the first top-level
+  /// field, etc.
+  ///
+  /// \return reference to the root ORC Type (STRUCT), owned by the reader.
+  const ::orc::Type& GetORCType();
 
  private:
   class Impl;
