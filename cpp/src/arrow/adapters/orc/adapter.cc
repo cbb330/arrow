@@ -39,10 +39,11 @@
 #include "arrow/type.h"
 #include "arrow/util/bit_util.h"
 #include "arrow/util/checked_cast.h"
-#include "arrow/util/decimal.h"
 #include "arrow/util/key_value_metadata.h"
 #include "arrow/util/macros.h"
 #include "orc/Exceptions.hh"
+#include "orc/Statistics.hh"
+#include "orc/Type.hh"
 
 // alias to not interfere with nested orc namespace
 namespace liborc = orc;
@@ -217,7 +218,7 @@ class ORCFileReader::Impl {
     std::unique_ptr<liborc::Reader> liborc_reader;
     ORC_CATCH_NOT_OK(liborc_reader = createReader(std::move(io_wrapper), options));
     pool_ = pool;
-    reader_ = std::move(liborc_reader);
+    reader_ = std::shared_ptr<liborc::Reader>(liborc_reader.release());
     current_row_ = 0;
 
     return Init();
@@ -409,6 +410,44 @@ class ORCFileReader::Impl {
     return ReadBatch(opts, schema, stripes_[static_cast<size_t>(stripe)].num_rows);
   }
 
+  Result<std::shared_ptr<Table>> ReadStripes(
+      const std::vector<int64_t>& stripe_indices) {
+    if (stripe_indices.empty()) {
+      ARROW_ASSIGN_OR_RAISE(auto schema, ReadSchema());
+      return Table::MakeEmpty(schema);
+    }
+
+    std::vector<std::shared_ptr<RecordBatch>> batches;
+    batches.reserve(stripe_indices.size());
+    for (int64_t stripe_index : stripe_indices) {
+      ARROW_ASSIGN_OR_RAISE(auto batch, ReadStripe(stripe_index));
+      batches.push_back(std::move(batch));
+    }
+    ARROW_ASSIGN_OR_RAISE(auto schema, ReadSchema());
+    return Table::FromRecordBatches(schema, std::move(batches));
+  }
+
+  Result<std::shared_ptr<Table>> ReadStripes(const std::vector<int64_t>& stripe_indices,
+                                              const std::vector<int>& include_indices) {
+    if (stripe_indices.empty()) {
+      liborc::RowReaderOptions opts = DefaultRowReaderOptions();
+      RETURN_NOT_OK(SelectIndices(&opts, include_indices));
+      ARROW_ASSIGN_OR_RAISE(auto schema, ReadSchema(opts));
+      return Table::MakeEmpty(schema);
+    }
+
+    std::vector<std::shared_ptr<RecordBatch>> batches;
+    batches.reserve(stripe_indices.size());
+    for (int64_t stripe_index : stripe_indices) {
+      ARROW_ASSIGN_OR_RAISE(auto batch, ReadStripe(stripe_index, include_indices));
+      batches.push_back(std::move(batch));
+    }
+    liborc::RowReaderOptions opts = DefaultRowReaderOptions();
+    RETURN_NOT_OK(SelectIndices(&opts, include_indices));
+    ARROW_ASSIGN_OR_RAISE(auto schema, ReadSchema(opts));
+    return Table::FromRecordBatches(schema, std::move(batches));
+  }
+
   Status SelectStripe(liborc::RowReaderOptions* opts, int64_t stripe) {
     ARROW_RETURN_IF(stripe < 0 || stripe >= NumberOfStripes(),
                     Status::Invalid("Out of bounds stripe: ", stripe));
@@ -526,7 +565,7 @@ class ORCFileReader::Impl {
                                              pool_);
   }
 
-  Result<std::shared_ptr<RecordBatchReader>> GetRecordBatchReader(
+  Result<std::unique_ptr<RecordBatchReader>> GetRecordBatchReader(
       int64_t batch_size, const std::vector<std::string>& include_names) {
     liborc::RowReaderOptions opts = DefaultRowReaderOptions();
     if (!include_names.empty()) {
@@ -539,7 +578,7 @@ class ORCFileReader::Impl {
     row_reader = reader_->createRowReader(opts);
     ORC_END_CATCH_NOT_OK
 
-    return std::make_shared<OrcStripeReader>(std::move(row_reader), schema, batch_size,
+    return std::make_unique<OrcStripeReader>(std::move(row_reader), schema, batch_size,
                                              pool_);
   }
 
@@ -548,9 +587,21 @@ class ORCFileReader::Impl {
     return NextStripeReader(batch_size, empty_vec);
   }
 
+  std::shared_ptr<FileMetaData> GetFileMetaData() {
+    try {
+      auto file_stats =
+          std::shared_ptr<const liborc::Statistics>(reader_->getStatistics().release());
+      return std::make_shared<FileMetaData>(reader_, std::move(file_stats));
+    } catch (...) {
+      return nullptr;
+    }
+  }
+
+  const liborc::Type& GetORCType() { return reader_->getType(); }
+
  private:
   MemoryPool* pool_;
-  std::unique_ptr<liborc::Reader> reader_;
+  std::shared_ptr<liborc::Reader> reader_;
   std::vector<StripeInformation> stripes_;
   int64_t current_row_;
 };
@@ -613,6 +664,17 @@ Result<std::shared_ptr<RecordBatch>> ORCFileReader::ReadStripe(
   return impl_->ReadStripe(stripe, include_names);
 }
 
+Result<std::shared_ptr<Table>> ORCFileReader::ReadStripes(
+    const std::vector<int64_t>& stripe_indices) {
+  return impl_->ReadStripes(stripe_indices);
+}
+
+Result<std::shared_ptr<Table>> ORCFileReader::ReadStripes(
+    const std::vector<int64_t>& stripe_indices,
+    const std::vector<int>& include_indices) {
+  return impl_->ReadStripes(stripe_indices, include_indices);
+}
+
 Status ORCFileReader::Seek(int64_t row_number) { return impl_->Seek(row_number); }
 
 Result<std::shared_ptr<RecordBatchReader>> ORCFileReader::NextStripeReader(
@@ -620,7 +682,7 @@ Result<std::shared_ptr<RecordBatchReader>> ORCFileReader::NextStripeReader(
   return impl_->NextStripeReader(batch_size);
 }
 
-Result<std::shared_ptr<RecordBatchReader>> ORCFileReader::GetRecordBatchReader(
+Result<std::unique_ptr<RecordBatchReader>> ORCFileReader::GetRecordBatchReader(
     int64_t batch_size, const std::vector<std::string>& include_names) {
   return impl_->GetRecordBatchReader(batch_size, include_names);
 }
@@ -677,6 +739,12 @@ int64_t ORCFileReader::GetFileLength() { return impl_->GetFileLength(); }
 std::string ORCFileReader::GetSerializedFileTail() {
   return impl_->GetSerializedFileTail();
 }
+
+std::shared_ptr<FileMetaData> ORCFileReader::GetFileMetaData() {
+  return impl_->GetFileMetaData();
+}
+
+const ::orc::Type& ORCFileReader::GetORCType() { return impl_->GetORCType(); }
 
 namespace {
 

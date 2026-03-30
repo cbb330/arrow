@@ -18,6 +18,7 @@
 #include <gmock/gmock-matchers.h>
 #include <gtest/gtest.h>
 
+#include <cmath>
 #include <orc/OrcFile.hh>
 #include <string>
 
@@ -36,6 +37,7 @@
 #include "arrow/testing/matchers.h"
 #include "arrow/testing/random.h"
 #include "arrow/type.h"
+#include "arrow/util/decimal.h"
 #include "arrow/util/io_util.h"
 #include "arrow/util/key_value_metadata.h"
 
@@ -334,6 +336,163 @@ std::unique_ptr<liborc::Writer> CreateWriter(uint64_t stripe_size,
   options.setMemoryPool(liborc::getDefaultPool());
   options.setRowIndexStride(0);
   return liborc::createWriter(type, stream, options);
+}
+
+Result<adapters::orc::Statistics> GetFileColumnStatistics(
+    adapters::orc::ORCFileReader* reader, int column_index) {
+  auto file_meta = reader->GetFileMetaData();
+  if (file_meta == nullptr) {
+    return Status::Invalid("Failed to read ORC file metadata");
+  }
+  if (column_index < 0 || column_index >= file_meta->num_columns()) {
+    return Status::Invalid("Column index ", column_index, " out of range");
+  }
+  auto column_meta = file_meta->Column(column_index);
+  if (column_meta == nullptr) {
+    return Status::Invalid("Failed to read ORC file column metadata");
+  }
+  auto column_stats = column_meta->statistics();
+  if (column_stats == nullptr) {
+    return Status::Invalid("Failed to read ORC file column statistics");
+  }
+  return *column_stats;
+}
+
+Result<adapters::orc::Statistics> GetStripeColumnStatistics(
+    adapters::orc::ORCFileReader* reader, int64_t stripe_index, int column_index) {
+  auto file_meta = reader->GetFileMetaData();
+  if (file_meta == nullptr) {
+    return Status::Invalid("Failed to read ORC file metadata");
+  }
+  if (stripe_index < 0 || stripe_index >= file_meta->num_stripes()) {
+    return Status::Invalid("Stripe index ", stripe_index, " out of range");
+  }
+  auto stripe_meta = file_meta->Stripe(static_cast<int>(stripe_index));
+  if (stripe_meta == nullptr) {
+    return Status::Invalid("Failed to read ORC stripe metadata");
+  }
+  if (column_index < 0 || column_index >= stripe_meta->num_columns()) {
+    return Status::Invalid("Column index ", column_index, " out of range");
+  }
+  auto column_meta = stripe_meta->Column(column_index);
+  if (column_meta == nullptr) {
+    return Status::Invalid("Failed to read ORC stripe column metadata");
+  }
+  auto column_stats = column_meta->statistics();
+  if (column_stats == nullptr) {
+    return Status::Invalid("Failed to read ORC stripe column statistics");
+  }
+  return *column_stats;
+}
+
+Result<std::vector<adapters::orc::Statistics>> GetStripeColumnStatisticsBulk(
+    adapters::orc::ORCFileReader* reader, int64_t stripe_index,
+    const std::vector<int>& column_indices) {
+  auto file_meta = reader->GetFileMetaData();
+  if (file_meta == nullptr) {
+    return Status::Invalid("Failed to read ORC file metadata");
+  }
+  if (stripe_index < 0 || stripe_index >= file_meta->num_stripes()) {
+    return Status::Invalid("Stripe index ", stripe_index, " out of range");
+  }
+  auto stripe_meta = file_meta->Stripe(static_cast<int>(stripe_index));
+  if (stripe_meta == nullptr) {
+    return Status::Invalid("Failed to read ORC stripe metadata");
+  }
+  std::vector<adapters::orc::Statistics> stats;
+  stats.reserve(column_indices.size());
+  for (int column_index : column_indices) {
+    if (column_index < 0 || column_index >= stripe_meta->num_columns()) {
+      return Status::Invalid("Column index ", column_index, " out of range");
+    }
+    auto column_meta = stripe_meta->Column(column_index);
+    if (column_meta == nullptr) {
+      return Status::Invalid("Failed to read ORC stripe column metadata");
+    }
+    auto column_stats = column_meta->statistics();
+    if (column_stats == nullptr) {
+      return Status::Invalid("Failed to read ORC stripe column statistics");
+    }
+    stats.push_back(std::move(*column_stats));
+  }
+  return stats;
+}
+
+struct ScalarStats {
+  bool has_null;
+  int64_t num_values;
+  bool has_min_max;
+  std::shared_ptr<Scalar> min;
+  std::shared_ptr<Scalar> max;
+};
+
+Result<ScalarStats> ToScalarStats(const adapters::orc::Statistics& statistics) {
+  ScalarStats converted;
+  converted.has_null = statistics.HasNullCount();
+  converted.num_values = statistics.num_values();
+  RETURN_NOT_OK(adapters::orc::StatisticsAsScalars(statistics, &converted.min, &converted.max));
+  converted.has_min_max = converted.min != nullptr && converted.max != nullptr;
+  return converted;
+}
+
+TEST(TestAdapterRead, FileMetaDataViewAccessors) {
+  MemoryOutputStream mem_stream(kDefaultMemStreamSize);
+  std::unique_ptr<liborc::Type> type(
+      liborc::Type::buildTypeFromString("struct<col1:int,col2:string>"));
+  constexpr uint64_t stripe_size = 1024;
+  constexpr uint64_t row_count = 256;
+
+  auto writer = CreateWriter(stripe_size, *type, &mem_stream);
+  auto batch = writer->createRowBatch(row_count);
+  auto struct_batch = internal::checked_cast<liborc::StructVectorBatch*>(batch.get());
+  auto long_batch =
+      internal::checked_cast<liborc::LongVectorBatch*>(struct_batch->fields[0]);
+  auto str_batch =
+      internal::checked_cast<liborc::StringVectorBatch*>(struct_batch->fields[1]);
+
+  std::string data_buffer(row_count * 5, '\0');
+  uint64_t offset = 0;
+  for (uint64_t i = 0; i < row_count; ++i) {
+    std::string str_data = std::to_string(i % 100);
+    long_batch->data[i] = static_cast<int64_t>(i);
+    str_batch->data[i] = &data_buffer[offset];
+    str_batch->length[i] = static_cast<int64_t>(str_data.size());
+    memcpy(&data_buffer[offset], str_data.c_str(), str_data.size());
+    offset += str_data.size();
+  }
+  struct_batch->numElements = row_count;
+  long_batch->numElements = row_count;
+  str_batch->numElements = row_count;
+  writer->add(*batch);
+  writer->close();
+
+  std::shared_ptr<io::RandomAccessFile> in_stream(new io::BufferReader(
+      std::make_shared<Buffer>(reinterpret_cast<const uint8_t*>(mem_stream.getData()),
+                               static_cast<int64_t>(mem_stream.getLength()))));
+  ASSERT_OK_AND_ASSIGN(auto reader,
+                       adapters::orc::ORCFileReader::Open(in_stream, default_memory_pool()));
+
+  auto file_meta = reader->GetFileMetaData();
+  ASSERT_NE(file_meta, nullptr);
+  EXPECT_TRUE(file_meta->valid());
+  EXPECT_EQ(file_meta->num_stripes(), reader->NumberOfStripes());
+  EXPECT_EQ(file_meta->num_rows(), reader->NumberOfRows());
+  auto metadata = file_meta->key_value_metadata();
+  ASSERT_NE(metadata, nullptr);
+  EXPECT_EQ(file_meta->schema_root().getKind(), liborc::STRUCT);
+
+  auto stripe_meta = file_meta->Stripe(0);
+  ASSERT_NE(stripe_meta, nullptr);
+  EXPECT_TRUE(stripe_meta->valid());
+  EXPECT_EQ(stripe_meta->stripe_index(), 0);
+  EXPECT_GT(stripe_meta->num_rows(), 0);
+  auto column_meta = stripe_meta->Column(1);
+  ASSERT_NE(column_meta, nullptr);
+  EXPECT_TRUE(column_meta->valid());
+  EXPECT_EQ(column_meta->column_index(), 1);
+  auto column_stats = column_meta->statistics();
+  ASSERT_NE(column_stats, nullptr);
+  EXPECT_TRUE(column_stats->valid());
 }
 
 TEST(TestAdapterRead, ReadIntAndStringFileMultipleStripes) {
@@ -1179,4 +1338,794 @@ TEST_F(TestORCWriterMultipleWrite, MultipleWritesIntFieldRecordBatch) {
   AssertBatchWriteReadEqual(input_batches, expected_output_table,
                             kDefaultSmallMemStreamSize * 100);
 }
+
+TEST(TestAdapterRead, GetColumnStatisticsInteger) {
+  MemoryOutputStream mem_stream(kDefaultMemStreamSize);
+  std::unique_ptr<liborc::Type> type(
+      liborc::Type::buildTypeFromString("struct<col1:int,col2:bigint>"));
+
+  constexpr uint64_t stripe_size = 1024;
+  constexpr uint64_t row_count = 1000;
+
+  auto writer = CreateWriter(stripe_size, *type, &mem_stream);
+  auto batch = writer->createRowBatch(row_count);
+  auto struct_batch = internal::checked_cast<liborc::StructVectorBatch*>(batch.get());
+  auto int_batch =
+      internal::checked_cast<liborc::LongVectorBatch*>(struct_batch->fields[0]);
+  auto bigint_batch =
+      internal::checked_cast<liborc::LongVectorBatch*>(struct_batch->fields[1]);
+
+  for (uint64_t i = 0; i < row_count; ++i) {
+    int_batch->data[i] = static_cast<int64_t>(i);
+    bigint_batch->data[i] = static_cast<int64_t>(i + 1000);
+  }
+  struct_batch->numElements = row_count;
+  int_batch->numElements = row_count;
+  bigint_batch->numElements = row_count;
+  writer->add(*batch);
+  writer->close();
+
+  std::shared_ptr<io::RandomAccessFile> in_stream(new io::BufferReader(
+      std::make_shared<Buffer>(reinterpret_cast<const uint8_t*>(mem_stream.getData()),
+                               static_cast<int64_t>(mem_stream.getLength()))));
+
+  ASSERT_OK_AND_ASSIGN(auto reader,
+                       adapters::orc::ORCFileReader::Open(in_stream, default_memory_pool()));
+
+  ASSERT_OK_AND_ASSIGN(auto col1_stats, GetFileColumnStatistics(reader.get(), 1));
+  ASSERT_OK_AND_ASSIGN(auto col1_scalars, ToScalarStats(col1_stats));
+  EXPECT_EQ(col1_scalars.num_values, row_count);
+  EXPECT_TRUE(col1_scalars.has_min_max);
+  ASSERT_NE(col1_scalars.min, nullptr);
+  ASSERT_NE(col1_scalars.max, nullptr);
+  EXPECT_EQ(checked_pointer_cast<Int64Scalar>(col1_scalars.min)->value, 0);
+  EXPECT_EQ(checked_pointer_cast<Int64Scalar>(col1_scalars.max)->value, 999);
+
+  ASSERT_OK_AND_ASSIGN(auto col2_stats, GetFileColumnStatistics(reader.get(), 2));
+  ASSERT_OK_AND_ASSIGN(auto col2_scalars, ToScalarStats(col2_stats));
+  EXPECT_EQ(col2_scalars.num_values, row_count);
+  EXPECT_TRUE(col2_scalars.has_min_max);
+  ASSERT_NE(col2_scalars.min, nullptr);
+  ASSERT_NE(col2_scalars.max, nullptr);
+  EXPECT_EQ(checked_pointer_cast<Int64Scalar>(col2_scalars.min)->value, 1000);
+  EXPECT_EQ(checked_pointer_cast<Int64Scalar>(col2_scalars.max)->value, 1999);
+}
+
+TEST(TestAdapterRead, GetStripeColumnStatistics) {
+  MemoryOutputStream mem_stream(kDefaultMemStreamSize);
+  std::unique_ptr<liborc::Type> type(
+      liborc::Type::buildTypeFromString("struct<col1:int>"));
+
+  constexpr uint64_t stripe_size = 1024;
+  constexpr uint64_t row_count = 500;
+
+  auto writer = CreateWriter(stripe_size, *type, &mem_stream);
+  auto batch = writer->createRowBatch(row_count);
+  auto struct_batch = internal::checked_cast<liborc::StructVectorBatch*>(batch.get());
+  auto int_batch =
+      internal::checked_cast<liborc::LongVectorBatch*>(struct_batch->fields[0]);
+
+  for (uint64_t i = 0; i < row_count; ++i) {
+    int_batch->data[i] = static_cast<int64_t>(i + 100);
+  }
+  struct_batch->numElements = row_count;
+  int_batch->numElements = row_count;
+  writer->add(*batch);
+  writer->close();
+
+  std::shared_ptr<io::RandomAccessFile> in_stream(new io::BufferReader(
+      std::make_shared<Buffer>(reinterpret_cast<const uint8_t*>(mem_stream.getData()),
+                               static_cast<int64_t>(mem_stream.getLength()))));
+
+  ASSERT_OK_AND_ASSIGN(auto reader,
+                       adapters::orc::ORCFileReader::Open(in_stream, default_memory_pool()));
+
+  ASSERT_OK_AND_ASSIGN(auto stripe0_stats,
+                       GetStripeColumnStatistics(reader.get(), 0, 1));
+  ASSERT_OK_AND_ASSIGN(auto stripe0_scalars, ToScalarStats(stripe0_stats));
+  EXPECT_TRUE(stripe0_scalars.has_min_max);
+  EXPECT_EQ(checked_pointer_cast<Int64Scalar>(stripe0_scalars.min)->value, 100);
+  EXPECT_EQ(checked_pointer_cast<Int64Scalar>(stripe0_scalars.max)->value, 599);
+}
+
+TEST(TestAdapterRead, GetColumnStatisticsString) {
+  MemoryOutputStream mem_stream(kDefaultMemStreamSize);
+  std::unique_ptr<liborc::Type> type(
+      liborc::Type::buildTypeFromString("struct<col1:string>"));
+
+  constexpr uint64_t stripe_size = 1024;
+  constexpr uint64_t row_count = 5;
+
+  auto writer = CreateWriter(stripe_size, *type, &mem_stream);
+  auto batch = writer->createRowBatch(row_count);
+  auto struct_batch = internal::checked_cast<liborc::StructVectorBatch*>(batch.get());
+  auto str_batch =
+      internal::checked_cast<liborc::StringVectorBatch*>(struct_batch->fields[0]);
+
+  std::vector<std::string> strings = {"apple", "banana", "cherry", "date", "elderberry"};
+  std::string data_buffer;
+  for (const auto& s : strings) {
+    data_buffer += s;
+  }
+
+  size_t offset = 0;
+  for (size_t i = 0; i < strings.size(); ++i) {
+    str_batch->data[i] = const_cast<char*>(&data_buffer[offset]);
+    str_batch->length[i] = static_cast<int64_t>(strings[i].size());
+    offset += strings[i].size();
+  }
+  struct_batch->numElements = row_count;
+  str_batch->numElements = row_count;
+  writer->add(*batch);
+  writer->close();
+
+  std::shared_ptr<io::RandomAccessFile> in_stream(new io::BufferReader(
+      std::make_shared<Buffer>(reinterpret_cast<const uint8_t*>(mem_stream.getData()),
+                               static_cast<int64_t>(mem_stream.getLength()))));
+
+  ASSERT_OK_AND_ASSIGN(auto reader,
+                       adapters::orc::ORCFileReader::Open(in_stream, default_memory_pool()));
+
+  ASSERT_OK_AND_ASSIGN(auto col_stats, GetFileColumnStatistics(reader.get(), 1));
+  ASSERT_OK_AND_ASSIGN(auto col_scalars, ToScalarStats(col_stats));
+  EXPECT_EQ(col_scalars.num_values, row_count);
+  EXPECT_TRUE(col_scalars.has_min_max);
+  ASSERT_NE(col_scalars.min, nullptr);
+  ASSERT_NE(col_scalars.max, nullptr);
+  EXPECT_EQ(checked_pointer_cast<StringScalar>(col_scalars.min)->ToString(), "apple");
+  EXPECT_EQ(checked_pointer_cast<StringScalar>(col_scalars.max)->ToString(), "elderberry");
+}
+
+TEST(TestAdapterRead, GetColumnStatisticsOutOfRange) {
+  MemoryOutputStream mem_stream(kDefaultMemStreamSize);
+  std::unique_ptr<liborc::Type> type(
+      liborc::Type::buildTypeFromString("struct<col1:int>"));
+
+  constexpr uint64_t stripe_size = 1024;
+  constexpr uint64_t row_count = 10;
+
+  auto writer = CreateWriter(stripe_size, *type, &mem_stream);
+  auto batch = writer->createRowBatch(row_count);
+  auto struct_batch = internal::checked_cast<liborc::StructVectorBatch*>(batch.get());
+  auto int_batch =
+      internal::checked_cast<liborc::LongVectorBatch*>(struct_batch->fields[0]);
+
+  for (uint64_t i = 0; i < row_count; ++i) {
+    int_batch->data[i] = static_cast<int64_t>(i);
+  }
+  struct_batch->numElements = row_count;
+  int_batch->numElements = row_count;
+  writer->add(*batch);
+  writer->close();
+
+  std::shared_ptr<io::RandomAccessFile> in_stream(new io::BufferReader(
+      std::make_shared<Buffer>(reinterpret_cast<const uint8_t*>(mem_stream.getData()),
+                               static_cast<int64_t>(mem_stream.getLength()))));
+
+  ASSERT_OK_AND_ASSIGN(auto reader,
+                       adapters::orc::ORCFileReader::Open(in_stream, default_memory_pool()));
+
+  EXPECT_THAT(GetFileColumnStatistics(reader.get(), 999),
+              Raises(StatusCode::Invalid, testing::HasSubstr("out of range")));
+
+  EXPECT_THAT(GetStripeColumnStatistics(reader.get(), 999, 1),
+              Raises(StatusCode::Invalid, testing::HasSubstr("out of range")));
+}
+
+TEST(TestAdapterRead, GetColumnStatisticsWithNulls) {
+  MemoryOutputStream mem_stream(kDefaultMemStreamSize);
+  std::unique_ptr<liborc::Type> type(
+      liborc::Type::buildTypeFromString("struct<col1:int>"));
+
+  constexpr uint64_t stripe_size = 1024;
+  constexpr uint64_t row_count = 10;
+
+  auto writer = CreateWriter(stripe_size, *type, &mem_stream);
+  auto batch = writer->createRowBatch(row_count);
+  auto struct_batch = internal::checked_cast<liborc::StructVectorBatch*>(batch.get());
+  auto int_batch =
+      internal::checked_cast<liborc::LongVectorBatch*>(struct_batch->fields[0]);
+
+  for (uint64_t i = 0; i < row_count; ++i) {
+    int_batch->data[i] = static_cast<int64_t>(i);
+    int_batch->notNull[i] = (i % 2 == 0) ? 1 : 0;
+  }
+  int_batch->hasNulls = true;
+  struct_batch->numElements = row_count;
+  int_batch->numElements = row_count;
+  writer->add(*batch);
+  writer->close();
+
+  std::shared_ptr<io::RandomAccessFile> in_stream(new io::BufferReader(
+      std::make_shared<Buffer>(reinterpret_cast<const uint8_t*>(mem_stream.getData()),
+                               static_cast<int64_t>(mem_stream.getLength()))));
+
+  ASSERT_OK_AND_ASSIGN(auto reader,
+                       adapters::orc::ORCFileReader::Open(in_stream, default_memory_pool()));
+
+  ASSERT_OK_AND_ASSIGN(auto col_stats, GetFileColumnStatistics(reader.get(), 1));
+  ASSERT_OK_AND_ASSIGN(auto col_scalars, ToScalarStats(col_stats));
+  EXPECT_TRUE(col_stats.HasNullCount());
+  EXPECT_TRUE(col_scalars.has_min_max);
+}
+
+TEST(TestAdapterRead, GetColumnStatisticsBoolean) {
+  MemoryOutputStream mem_stream(kDefaultMemStreamSize);
+  std::unique_ptr<liborc::Type> type(
+      liborc::Type::buildTypeFromString("struct<col1:boolean>"));
+
+  constexpr uint64_t stripe_size = 1024;
+  constexpr uint64_t row_count = 100;
+
+  auto writer = CreateWriter(stripe_size, *type, &mem_stream);
+  auto batch = writer->createRowBatch(row_count);
+  auto struct_batch = internal::checked_cast<liborc::StructVectorBatch*>(batch.get());
+  auto bool_batch =
+      internal::checked_cast<liborc::LongVectorBatch*>(struct_batch->fields[0]);
+
+  // Write 60 true values and 40 false values
+  for (uint64_t i = 0; i < row_count; ++i) {
+    bool_batch->data[i] = (i < 60) ? 1 : 0;
+  }
+  struct_batch->numElements = row_count;
+  bool_batch->numElements = row_count;
+  writer->add(*batch);
+  writer->close();
+
+  std::shared_ptr<io::RandomAccessFile> in_stream(new io::BufferReader(
+      std::make_shared<Buffer>(reinterpret_cast<const uint8_t*>(mem_stream.getData()),
+                               static_cast<int64_t>(mem_stream.getLength()))));
+
+  ASSERT_OK_AND_ASSIGN(auto reader,
+                       adapters::orc::ORCFileReader::Open(in_stream, default_memory_pool()));
+
+  ASSERT_OK_AND_ASSIGN(auto col_stats, GetFileColumnStatistics(reader.get(), 1));
+  ASSERT_OK_AND_ASSIGN(auto col_scalars, ToScalarStats(col_stats));
+  EXPECT_EQ(col_scalars.num_values, row_count);
+  EXPECT_FALSE(col_scalars.has_min_max);  // Boolean types don't have min/max
+  EXPECT_EQ(col_scalars.min, nullptr);
+  EXPECT_EQ(col_scalars.max, nullptr);
+}
+
+TEST(TestAdapterRead, GetColumnStatisticsDate) {
+  MemoryOutputStream mem_stream(kDefaultMemStreamSize);
+  std::unique_ptr<liborc::Type> type(
+      liborc::Type::buildTypeFromString("struct<col1:date>"));
+
+  constexpr uint64_t stripe_size = 1024;
+  constexpr uint64_t row_count = 10;
+
+  auto writer = CreateWriter(stripe_size, *type, &mem_stream);
+  auto batch = writer->createRowBatch(row_count);
+  auto struct_batch = internal::checked_cast<liborc::StructVectorBatch*>(batch.get());
+  auto date_batch =
+      internal::checked_cast<liborc::LongVectorBatch*>(struct_batch->fields[0]);
+
+  // Write dates: 0 (1970-01-01) through 9 (1970-01-10)
+  for (uint64_t i = 0; i < row_count; ++i) {
+    date_batch->data[i] = static_cast<int64_t>(i);
+  }
+  struct_batch->numElements = row_count;
+  date_batch->numElements = row_count;
+  writer->add(*batch);
+  writer->close();
+
+  std::shared_ptr<io::RandomAccessFile> in_stream(new io::BufferReader(
+      std::make_shared<Buffer>(reinterpret_cast<const uint8_t*>(mem_stream.getData()),
+                               static_cast<int64_t>(mem_stream.getLength()))));
+
+  ASSERT_OK_AND_ASSIGN(auto reader,
+                       adapters::orc::ORCFileReader::Open(in_stream, default_memory_pool()));
+
+  ASSERT_OK_AND_ASSIGN(auto col_stats, GetFileColumnStatistics(reader.get(), 1));
+  ASSERT_OK_AND_ASSIGN(auto col_scalars, ToScalarStats(col_stats));
+  EXPECT_EQ(col_scalars.num_values, row_count);
+  EXPECT_TRUE(col_scalars.has_min_max);
+  ASSERT_NE(col_scalars.min, nullptr);
+  ASSERT_NE(col_scalars.max, nullptr);
+  EXPECT_EQ(checked_pointer_cast<Date32Scalar>(col_scalars.min)->value, 0);
+  EXPECT_EQ(checked_pointer_cast<Date32Scalar>(col_scalars.max)->value, 9);
+}
+
+TEST(TestAdapterRead, GetColumnStatisticsTimestamp) {
+  MemoryOutputStream mem_stream(kDefaultMemStreamSize);
+  std::unique_ptr<liborc::Type> type(
+      liborc::Type::buildTypeFromString("struct<col1:timestamp>"));
+
+  constexpr uint64_t stripe_size = 1024;
+  constexpr uint64_t row_count = 10;
+
+  auto writer = CreateWriter(stripe_size, *type, &mem_stream);
+  auto batch = writer->createRowBatch(row_count);
+  auto struct_batch = internal::checked_cast<liborc::StructVectorBatch*>(batch.get());
+  auto ts_batch =
+      internal::checked_cast<liborc::TimestampVectorBatch*>(struct_batch->fields[0]);
+
+  // Write timestamps with both seconds and nanoseconds
+  for (uint64_t i = 0; i < row_count; ++i) {
+    ts_batch->data[i] = static_cast<int64_t>(i * 1000);  // seconds
+    ts_batch->nanoseconds[i] = static_cast<int64_t>(i * 100);  // nanoseconds
+  }
+  struct_batch->numElements = row_count;
+  ts_batch->numElements = row_count;
+  writer->add(*batch);
+  writer->close();
+
+  std::shared_ptr<io::RandomAccessFile> in_stream(new io::BufferReader(
+      std::make_shared<Buffer>(reinterpret_cast<const uint8_t*>(mem_stream.getData()),
+                               static_cast<int64_t>(mem_stream.getLength()))));
+
+  ASSERT_OK_AND_ASSIGN(auto reader,
+                       adapters::orc::ORCFileReader::Open(in_stream, default_memory_pool()));
+
+  ASSERT_OK_AND_ASSIGN(auto col_stats, GetFileColumnStatistics(reader.get(), 1));
+  ASSERT_OK_AND_ASSIGN(auto col_scalars, ToScalarStats(col_stats));
+  EXPECT_EQ(col_scalars.num_values, row_count);
+  EXPECT_TRUE(col_scalars.has_min_max);
+  ASSERT_NE(col_scalars.min, nullptr);
+  ASSERT_NE(col_scalars.max, nullptr);
+
+  // Verify the timestamps are TimestampScalar with correct nanosecond values.
+  // Written: data[i] = i*1000 seconds, nanoseconds[i] = i*100 sub-second nanos.
+  // Min (i=0): 0s + 0ns = 0 ns total.
+  // Max (i=9): 9000s + 900ns = 9000 * 1,000,000,000 + 900 = 9,000,000,000,900 ns.
+  // Statistics store millis + sub-ms-nanos (last 6 digits of ns).
+  // Conversion: millis * 1,000,000 + sub_ms_nanos = total nanoseconds.
+  auto min_ts = checked_pointer_cast<TimestampScalar>(col_scalars.min);
+  auto max_ts = checked_pointer_cast<TimestampScalar>(col_scalars.max);
+  EXPECT_TRUE(min_ts->is_valid);
+  EXPECT_TRUE(max_ts->is_valid);
+  EXPECT_EQ(min_ts->value, 0);
+  // 9000 seconds + 900 nanoseconds
+  constexpr int64_t expected_max_ns = 9000LL * 1000000000LL + 900LL;
+  EXPECT_EQ(max_ts->value, expected_max_ns);
+}
+
+TEST(TestAdapterRead, ReadStripesMultiple) {
+  // Create a test file and read all stripes using ReadStripes
+  MemoryOutputStream mem_stream(kDefaultMemStreamSize);
+  std::unique_ptr<liborc::Type> type(
+      liborc::Type::buildTypeFromString("struct<col1:int,col2:bigint>"));
+
+  constexpr uint64_t stripe_size = 1024;
+  constexpr uint64_t row_count = 100;
+
+  auto writer = CreateWriter(stripe_size, *type, &mem_stream);
+  auto batch = writer->createRowBatch(row_count);
+  auto struct_batch = internal::checked_cast<liborc::StructVectorBatch*>(batch.get());
+  auto int_batch =
+      internal::checked_cast<liborc::LongVectorBatch*>(struct_batch->fields[0]);
+  auto bigint_batch =
+      internal::checked_cast<liborc::LongVectorBatch*>(struct_batch->fields[1]);
+
+  for (uint64_t i = 0; i < row_count; ++i) {
+    int_batch->data[i] = static_cast<int64_t>(i);
+    bigint_batch->data[i] = static_cast<int64_t>(i + 1000);
+  }
+  struct_batch->numElements = row_count;
+  int_batch->numElements = row_count;
+  bigint_batch->numElements = row_count;
+  writer->add(*batch);
+  writer->close();
+
+  std::shared_ptr<io::RandomAccessFile> in_stream(new io::BufferReader(
+      std::make_shared<Buffer>(reinterpret_cast<const uint8_t*>(mem_stream.getData()),
+                               static_cast<int64_t>(mem_stream.getLength()))));
+
+  ASSERT_OK_AND_ASSIGN(auto reader,
+                       adapters::orc::ORCFileReader::Open(in_stream, default_memory_pool()));
+
+  int64_t num_stripes = reader->NumberOfStripes();
+  ASSERT_GT(num_stripes, 0);
+
+  // Build vector of all stripe indices
+  std::vector<int64_t> stripe_indices;
+  for (int64_t i = 0; i < num_stripes; ++i) {
+    stripe_indices.push_back(i);
+  }
+
+  // Read all stripes using ReadStripes
+  ASSERT_OK_AND_ASSIGN(auto table, reader->ReadStripes(stripe_indices));
+
+  // Should have all rows and correct schema
+  EXPECT_EQ(table->num_rows(), row_count);
+  EXPECT_EQ(table->num_columns(), 2);
+  EXPECT_EQ(table->schema()->field(0)->name(), "col1");
+  EXPECT_EQ(table->schema()->field(1)->name(), "col2");
+}
+
+TEST(TestAdapterRead, ReadStripesWithColumnSelection) {
+  // Create a test file with multiple columns
+  MemoryOutputStream mem_stream(kDefaultMemStreamSize);
+  std::unique_ptr<liborc::Type> type(liborc::Type::buildTypeFromString(
+      "struct<col1:int,col2:bigint,col3:double>"));
+
+  constexpr uint64_t stripe_size = 1024;
+  constexpr uint64_t row_count = 100;
+
+  auto writer = CreateWriter(stripe_size, *type, &mem_stream);
+  auto batch = writer->createRowBatch(row_count);
+  auto struct_batch = internal::checked_cast<liborc::StructVectorBatch*>(batch.get());
+  auto int_batch =
+      internal::checked_cast<liborc::LongVectorBatch*>(struct_batch->fields[0]);
+  auto bigint_batch =
+      internal::checked_cast<liborc::LongVectorBatch*>(struct_batch->fields[1]);
+  auto double_batch =
+      internal::checked_cast<liborc::DoubleVectorBatch*>(struct_batch->fields[2]);
+
+  for (uint64_t i = 0; i < row_count; ++i) {
+    int_batch->data[i] = static_cast<int64_t>(i);
+    bigint_batch->data[i] = static_cast<int64_t>(i + 100);
+    double_batch->data[i] = static_cast<double>(i) + 0.5;
+  }
+  struct_batch->numElements = row_count;
+  int_batch->numElements = row_count;
+  bigint_batch->numElements = row_count;
+  double_batch->numElements = row_count;
+  writer->add(*batch);
+  writer->close();
+
+  std::shared_ptr<io::RandomAccessFile> in_stream(new io::BufferReader(
+      std::make_shared<Buffer>(reinterpret_cast<const uint8_t*>(mem_stream.getData()),
+                               static_cast<int64_t>(mem_stream.getLength()))));
+
+  ASSERT_OK_AND_ASSIGN(auto reader,
+                       adapters::orc::ORCFileReader::Open(in_stream, default_memory_pool()));
+
+  int64_t num_stripes = reader->NumberOfStripes();
+  ASSERT_GT(num_stripes, 0);
+
+  // Build vector of all stripe indices
+  std::vector<int64_t> stripe_indices;
+  for (int64_t i = 0; i < num_stripes; ++i) {
+    stripe_indices.push_back(i);
+  }
+
+  // Read all stripes but only columns 0 and 2 (col1 and col3)
+  std::vector<int> include_indices = {0, 2};
+  ASSERT_OK_AND_ASSIGN(auto table, reader->ReadStripes(stripe_indices, include_indices));
+
+  // Should have all rows and 2 columns
+  EXPECT_EQ(table->num_rows(), row_count);
+  EXPECT_EQ(table->num_columns(), 2);
+
+  // Verify we got the right columns (col2 was skipped)
+  EXPECT_EQ(table->schema()->field(0)->name(), "col1");
+  EXPECT_EQ(table->schema()->field(1)->name(), "col3");
+}
+
+TEST(TestAdapterRead, ReadStripesOutOfRange) {
+  MemoryOutputStream mem_stream(kDefaultMemStreamSize);
+  std::unique_ptr<liborc::Type> type(
+      liborc::Type::buildTypeFromString("struct<col1:int>"));
+
+  constexpr uint64_t stripe_size = 512;
+  constexpr uint64_t row_count = 100;
+
+  auto writer = CreateWriter(stripe_size, *type, &mem_stream);
+  auto batch = writer->createRowBatch(row_count);
+  auto struct_batch = internal::checked_cast<liborc::StructVectorBatch*>(batch.get());
+  auto int_batch =
+      internal::checked_cast<liborc::LongVectorBatch*>(struct_batch->fields[0]);
+
+  for (uint64_t i = 0; i < row_count; ++i) {
+    int_batch->data[i] = static_cast<int64_t>(i);
+  }
+  struct_batch->numElements = row_count;
+  int_batch->numElements = row_count;
+  writer->add(*batch);
+  writer->close();
+
+  std::shared_ptr<io::RandomAccessFile> in_stream(new io::BufferReader(
+      std::make_shared<Buffer>(reinterpret_cast<const uint8_t*>(mem_stream.getData()),
+                               static_cast<int64_t>(mem_stream.getLength()))));
+
+  ASSERT_OK_AND_ASSIGN(auto reader,
+                       adapters::orc::ORCFileReader::Open(in_stream, default_memory_pool()));
+
+  int64_t num_stripes = reader->NumberOfStripes();
+  ASSERT_GT(num_stripes, 0);
+
+  // Try to read a stripe index that's out of range
+  std::vector<int64_t> stripe_indices = {0, num_stripes};  // num_stripes is out of range
+  EXPECT_THAT(reader->ReadStripes(stripe_indices),
+              Raises(StatusCode::Invalid, testing::HasSubstr("Out of bounds stripe")));
+}
+
+TEST(TestAdapterRead, ReadStripesEmptyVector) {
+  MemoryOutputStream mem_stream(kDefaultMemStreamSize);
+  std::unique_ptr<liborc::Type> type(
+      liborc::Type::buildTypeFromString("struct<col1:int>"));
+
+  constexpr uint64_t stripe_size = 512;
+  constexpr uint64_t row_count = 100;
+
+  auto writer = CreateWriter(stripe_size, *type, &mem_stream);
+  auto batch = writer->createRowBatch(row_count);
+  auto struct_batch = internal::checked_cast<liborc::StructVectorBatch*>(batch.get());
+  auto int_batch =
+      internal::checked_cast<liborc::LongVectorBatch*>(struct_batch->fields[0]);
+
+  for (uint64_t i = 0; i < row_count; ++i) {
+    int_batch->data[i] = static_cast<int64_t>(i);
+  }
+  struct_batch->numElements = row_count;
+  int_batch->numElements = row_count;
+  writer->add(*batch);
+  writer->close();
+
+  std::shared_ptr<io::RandomAccessFile> in_stream(new io::BufferReader(
+      std::make_shared<Buffer>(reinterpret_cast<const uint8_t*>(mem_stream.getData()),
+                               static_cast<int64_t>(mem_stream.getLength()))));
+
+  ASSERT_OK_AND_ASSIGN(auto reader,
+                       adapters::orc::ORCFileReader::Open(in_stream, default_memory_pool()));
+
+  // Empty stripe indices should return an empty table with the file's schema
+  std::vector<int64_t> stripe_indices;
+  ASSERT_OK_AND_ASSIGN(auto table, reader->ReadStripes(stripe_indices));
+  EXPECT_EQ(table->num_rows(), 0);
+  EXPECT_EQ(table->num_columns(), 1);
+  EXPECT_EQ(table->schema()->field(0)->name(), "col1");
+}
+
+TEST(TestAdapterRead, GetORCType) {
+  MemoryOutputStream mem_stream(kDefaultMemStreamSize);
+  std::unique_ptr<liborc::Type> type(liborc::Type::buildTypeFromString(
+      "struct<col1:int,col2:bigint,col3:string>"));
+
+  constexpr uint64_t stripe_size = 1024;
+  constexpr uint64_t row_count = 10;
+
+  auto writer = CreateWriter(stripe_size, *type, &mem_stream);
+  auto batch = writer->createRowBatch(row_count);
+  auto struct_batch = internal::checked_cast<liborc::StructVectorBatch*>(batch.get());
+
+  struct_batch->numElements = row_count;
+  for (size_t i = 0; i < struct_batch->fields.size(); ++i) {
+    struct_batch->fields[i]->numElements = row_count;
+  }
+  writer->add(*batch);
+  writer->close();
+
+  std::shared_ptr<io::RandomAccessFile> in_stream(new io::BufferReader(
+      std::make_shared<Buffer>(reinterpret_cast<const uint8_t*>(mem_stream.getData()),
+                               static_cast<int64_t>(mem_stream.getLength()))));
+
+  ASSERT_OK_AND_ASSIGN(auto reader,
+                       adapters::orc::ORCFileReader::Open(in_stream, default_memory_pool()));
+
+  // Get the ORC type — returns a reference, no cast needed
+  const liborc::Type& orc_type = reader->GetORCType();
+
+  // Root should be STRUCT
+  EXPECT_EQ(orc_type.getKind(), liborc::STRUCT);
+
+  // Should have 3 subtypes (col1, col2, col3)
+  EXPECT_EQ(orc_type.getSubtypeCount(), 3);
+
+  // Verify field names
+  EXPECT_EQ(orc_type.getFieldName(0), "col1");
+  EXPECT_EQ(orc_type.getFieldName(1), "col2");
+  EXPECT_EQ(orc_type.getFieldName(2), "col3");
+
+  // Verify field types
+  EXPECT_EQ(orc_type.getSubtype(0)->getKind(), liborc::INT);
+  EXPECT_EQ(orc_type.getSubtype(1)->getKind(), liborc::LONG);
+  EXPECT_EQ(orc_type.getSubtype(2)->getKind(), liborc::STRING);
+}
+
+TEST(TestAdapterRead, GetColumnStatisticsDoubleNaN) {
+  MemoryOutputStream mem_stream(kDefaultMemStreamSize);
+  std::unique_ptr<liborc::Type> type(
+      liborc::Type::buildTypeFromString("struct<col1:double>"));
+
+  constexpr uint64_t stripe_size = 1024;
+  constexpr uint64_t row_count = 10;
+
+  auto writer = CreateWriter(stripe_size, *type, &mem_stream);
+  auto batch = writer->createRowBatch(row_count);
+  auto struct_batch = internal::checked_cast<liborc::StructVectorBatch*>(batch.get());
+  auto double_batch =
+      internal::checked_cast<liborc::DoubleVectorBatch*>(struct_batch->fields[0]);
+
+  // Write some normal values and some NaN values
+  for (uint64_t i = 0; i < row_count; ++i) {
+    if (i % 3 == 0) {
+      double_batch->data[i] = std::numeric_limits<double>::quiet_NaN();
+    } else {
+      double_batch->data[i] = static_cast<double>(i);
+    }
+  }
+  struct_batch->numElements = row_count;
+  double_batch->numElements = row_count;
+  writer->add(*batch);
+  writer->close();
+
+  std::shared_ptr<io::RandomAccessFile> in_stream(new io::BufferReader(
+      std::make_shared<Buffer>(reinterpret_cast<const uint8_t*>(mem_stream.getData()),
+                               static_cast<int64_t>(mem_stream.getLength()))));
+
+  ASSERT_OK_AND_ASSIGN(auto reader,
+                       adapters::orc::ORCFileReader::Open(in_stream, default_memory_pool()));
+
+  ASSERT_OK_AND_ASSIGN(auto col_stats, GetFileColumnStatistics(reader.get(), 1));
+  ASSERT_OK_AND_ASSIGN(auto col_scalars, ToScalarStats(col_stats));
+  // When NaN values are present, ORC may report NaN as min or max.
+  // Our guard should detect this and set has_min_max = false.
+  if (col_scalars.has_min_max) {
+    // If ORC writer filtered NaN from statistics, min/max should be valid (non-NaN)
+    auto min_val = checked_pointer_cast<DoubleScalar>(col_scalars.min);
+    auto max_val = checked_pointer_cast<DoubleScalar>(col_scalars.max);
+    EXPECT_FALSE(std::isnan(min_val->value));
+    EXPECT_FALSE(std::isnan(max_val->value));
+  }
+  // Either has_min_max is false (NaN guard triggered), or min/max are non-NaN.
+  // Both outcomes are correct.
+}
+
+TEST(TestAdapterRead, GetColumnStatisticsNegativeIndex) {
+  MemoryOutputStream mem_stream(kDefaultMemStreamSize);
+  std::unique_ptr<liborc::Type> type(
+      liborc::Type::buildTypeFromString("struct<col1:int>"));
+
+  constexpr uint64_t stripe_size = 1024;
+  constexpr uint64_t row_count = 10;
+
+  auto writer = CreateWriter(stripe_size, *type, &mem_stream);
+  auto batch = writer->createRowBatch(row_count);
+  auto struct_batch = internal::checked_cast<liborc::StructVectorBatch*>(batch.get());
+  auto int_batch =
+      internal::checked_cast<liborc::LongVectorBatch*>(struct_batch->fields[0]);
+
+  for (uint64_t i = 0; i < row_count; ++i) {
+    int_batch->data[i] = static_cast<int64_t>(i);
+  }
+  struct_batch->numElements = row_count;
+  int_batch->numElements = row_count;
+  writer->add(*batch);
+  writer->close();
+
+  std::shared_ptr<io::RandomAccessFile> in_stream(new io::BufferReader(
+      std::make_shared<Buffer>(reinterpret_cast<const uint8_t*>(mem_stream.getData()),
+                               static_cast<int64_t>(mem_stream.getLength()))));
+
+  ASSERT_OK_AND_ASSIGN(auto reader,
+                       adapters::orc::ORCFileReader::Open(in_stream, default_memory_pool()));
+
+  // Negative column index should return Invalid
+  EXPECT_THAT(GetFileColumnStatistics(reader.get(), -1),
+              Raises(StatusCode::Invalid, testing::HasSubstr("out of range")));
+
+  // Negative column index in stripe stats should also return Invalid
+  EXPECT_THAT(GetStripeColumnStatistics(reader.get(), 0, -1),
+              Raises(StatusCode::Invalid, testing::HasSubstr("out of range")));
+}
+
+TEST(TestAdapterRead, GetStripeStatisticsBulk) {
+  MemoryOutputStream mem_stream(kDefaultMemStreamSize);
+  std::unique_ptr<liborc::Type> type(liborc::Type::buildTypeFromString(
+      "struct<col1:int,col2:bigint,col3:double>"));
+
+  constexpr uint64_t stripe_size = 1024;
+  constexpr uint64_t row_count = 100;
+
+  auto writer = CreateWriter(stripe_size, *type, &mem_stream);
+  auto batch = writer->createRowBatch(row_count);
+  auto struct_batch = internal::checked_cast<liborc::StructVectorBatch*>(batch.get());
+  auto int_batch =
+      internal::checked_cast<liborc::LongVectorBatch*>(struct_batch->fields[0]);
+  auto bigint_batch =
+      internal::checked_cast<liborc::LongVectorBatch*>(struct_batch->fields[1]);
+  auto double_batch =
+      internal::checked_cast<liborc::DoubleVectorBatch*>(struct_batch->fields[2]);
+
+  for (uint64_t i = 0; i < row_count; ++i) {
+    int_batch->data[i] = static_cast<int64_t>(i);
+    bigint_batch->data[i] = static_cast<int64_t>(i + 1000);
+    double_batch->data[i] = static_cast<double>(i) + 0.5;
+  }
+  struct_batch->numElements = row_count;
+  int_batch->numElements = row_count;
+  bigint_batch->numElements = row_count;
+  double_batch->numElements = row_count;
+  writer->add(*batch);
+  writer->close();
+
+  std::shared_ptr<io::RandomAccessFile> in_stream(new io::BufferReader(
+      std::make_shared<Buffer>(reinterpret_cast<const uint8_t*>(mem_stream.getData()),
+                               static_cast<int64_t>(mem_stream.getLength()))));
+
+  ASSERT_OK_AND_ASSIGN(auto reader,
+                       adapters::orc::ORCFileReader::Open(in_stream, default_memory_pool()));
+
+  // ORC column indices: 0=root struct, 1=col1, 2=col2, 3=col3
+  std::vector<int> column_indices = {1, 2, 3};
+
+  // Get bulk stats for stripe 0
+  ASSERT_OK_AND_ASSIGN(auto bulk_stats,
+                       GetStripeColumnStatisticsBulk(reader.get(), 0, column_indices));
+  ASSERT_EQ(bulk_stats.size(), 3);
+
+  // Verify bulk results match individual GetStripeColumnStatistics calls
+  for (size_t i = 0; i < column_indices.size(); ++i) {
+    ASSERT_OK_AND_ASSIGN(
+        auto individual_stats,
+        GetStripeColumnStatistics(reader.get(), 0, column_indices[i]));
+    ASSERT_OK_AND_ASSIGN(auto bulk_scalars, ToScalarStats(bulk_stats[i]));
+    ASSERT_OK_AND_ASSIGN(auto individual_scalars, ToScalarStats(individual_stats));
+    EXPECT_EQ(bulk_stats[i].HasNullCount(), individual_stats.HasNullCount());
+    EXPECT_EQ(bulk_scalars.num_values, individual_scalars.num_values);
+    EXPECT_EQ(bulk_scalars.has_min_max, individual_scalars.has_min_max);
+    if (bulk_scalars.has_min_max && individual_scalars.has_min_max) {
+      EXPECT_TRUE(bulk_scalars.min->Equals(*individual_scalars.min));
+      EXPECT_TRUE(bulk_scalars.max->Equals(*individual_scalars.max));
+    }
+  }
+
+  // Verify out-of-range column index in bulk API
+  std::vector<int> bad_indices = {1, 999};
+  EXPECT_THAT(GetStripeColumnStatisticsBulk(reader.get(), 0, bad_indices),
+              Raises(StatusCode::Invalid, testing::HasSubstr("out of range")));
+
+  // Verify out-of-range stripe index in bulk API
+  EXPECT_THAT(GetStripeColumnStatisticsBulk(reader.get(), 999, column_indices),
+              Raises(StatusCode::Invalid, testing::HasSubstr("out of range")));
+}
+
+TEST(TestAdapterRead, GetColumnStatisticsDecimal) {
+  MemoryOutputStream mem_stream(kDefaultMemStreamSize);
+  // decimal(10,2) uses Decimal64VectorBatch internally (precision <= 18)
+  std::unique_ptr<liborc::Type> type(
+      liborc::Type::buildTypeFromString("struct<col1:decimal(10,2)>"));
+
+  constexpr uint64_t stripe_size = 1024;
+  constexpr uint64_t row_count = 5;
+
+  auto writer = CreateWriter(stripe_size, *type, &mem_stream);
+  auto batch = writer->createRowBatch(row_count);
+  auto struct_batch = internal::checked_cast<liborc::StructVectorBatch*>(batch.get());
+  auto dec_batch =
+      internal::checked_cast<liborc::Decimal64VectorBatch*>(struct_batch->fields[0]);
+
+  // Write unscaled values with non-zero trailing digits to avoid ORC
+  // normalizing away trailing zeros in statistics (e.g. 1.00 → 1 scale 0).
+  // Values: 101, 203, 305, 407, 509 with scale=2
+  // Represent: 1.01, 2.03, 3.05, 4.07, 5.09
+  dec_batch->values[0] = 101;
+  dec_batch->values[1] = 203;
+  dec_batch->values[2] = 305;
+  dec_batch->values[3] = 407;
+  dec_batch->values[4] = 509;
+  struct_batch->numElements = row_count;
+  dec_batch->numElements = row_count;
+  writer->add(*batch);
+  writer->close();
+
+  std::shared_ptr<io::RandomAccessFile> in_stream(new io::BufferReader(
+      std::make_shared<Buffer>(reinterpret_cast<const uint8_t*>(mem_stream.getData()),
+                               static_cast<int64_t>(mem_stream.getLength()))));
+
+  ASSERT_OK_AND_ASSIGN(auto reader,
+                       adapters::orc::ORCFileReader::Open(in_stream, default_memory_pool()));
+
+  ASSERT_OK_AND_ASSIGN(auto col_stats, GetFileColumnStatistics(reader.get(), 1));
+  ASSERT_OK_AND_ASSIGN(auto col_scalars, ToScalarStats(col_stats));
+  EXPECT_EQ(col_scalars.num_values, row_count);
+  EXPECT_FALSE(col_stats.HasNullCount());
+  EXPECT_TRUE(col_scalars.has_min_max);
+  ASSERT_NE(col_scalars.min, nullptr);
+  ASSERT_NE(col_scalars.max, nullptr);
+
+  // Verify Decimal128Scalar values (unscaled integers with scale 2)
+  auto min_dec = checked_pointer_cast<Decimal128Scalar>(col_scalars.min);
+  auto max_dec = checked_pointer_cast<Decimal128Scalar>(col_scalars.max);
+  EXPECT_EQ(min_dec->value, Decimal128(101));   // 1.01 unscaled
+  EXPECT_EQ(max_dec->value, Decimal128(509));   // 5.09 unscaled
+
+  // Verify the type has precision 38 and scale 2 (as set by ConvertColumnStatistics)
+  EXPECT_TRUE(min_dec->type->Equals(decimal128(38, 2)));
+  EXPECT_TRUE(max_dec->type->Equals(decimal128(38, 2)));
+}
+
 }  // namespace arrow

@@ -22,14 +22,18 @@
 #include <vector>
 
 #include "arrow/adapters/orc/options.h"
+#include "arrow/adapters/orc/statistics.h"
 #include "arrow/io/interfaces.h"
 #include "arrow/memory_pool.h"
 #include "arrow/record_batch.h"
 #include "arrow/status.h"
-#include "arrow/type.h"
 #include "arrow/type_fwd.h"
 #include "arrow/util/macros.h"
 #include "arrow/util/visibility.h"
+
+namespace orc {
+class Type;
+}  // namespace orc
 
 namespace arrow {
 namespace adapters {
@@ -129,6 +133,29 @@ class ARROW_EXPORT ORCFileReader {
   Result<std::shared_ptr<RecordBatch>> ReadStripe(
       int64_t stripe, const std::vector<std::string>& include_names);
 
+  /// \brief Read multiple selected stripes as a Table
+  ///
+  /// Reads only the specified stripes and concatenates them into a single table.
+  /// This is useful for stripe-selective reading based on predicate pushdown.
+  /// If stripe_indices is empty, returns an empty table with the file's schema.
+  ///
+  /// \param[in] stripe_indices the indices of stripes to read
+  /// \return the returned Table containing data from the selected stripes
+  Result<std::shared_ptr<Table>> ReadStripes(
+      const std::vector<int64_t>& stripe_indices);
+
+  /// \brief Read multiple selected stripes with column selection as a Table
+  ///
+  /// Reads only the specified stripes and selected columns, concatenating them
+  /// into a single table.
+  /// If stripe_indices is empty, returns an empty table with the selected schema.
+  ///
+  /// \param[in] stripe_indices the indices of stripes to read
+  /// \param[in] include_indices the selected field indices to read
+  /// \return the returned Table containing data from the selected stripes and columns
+  Result<std::shared_ptr<Table>> ReadStripes(const std::vector<int64_t>& stripe_indices,
+                                              const std::vector<int>& include_indices);
+
   /// \brief Seek to designated row. Invoke NextStripeReader() after seek
   ///        will return stripe reader starting from designated row.
   ///
@@ -171,7 +198,7 @@ class ARROW_EXPORT ORCFileReader {
   /// \param[in] include_names the selected field names to read, if not empty
   /// (otherwise all fields are read)
   /// \return the record batch iterator
-  Result<std::shared_ptr<RecordBatchReader>> GetRecordBatchReader(
+  Result<std::unique_ptr<RecordBatchReader>> GetRecordBatchReader(
       int64_t batch_size, const std::vector<std::string>& include_names);
 
   /// \brief The number of stripes in the file
@@ -266,6 +293,14 @@ class ARROW_EXPORT ORCFileReader {
   ///
   /// \return A KeyValueMetadata object containing the ORC metadata
   Result<std::shared_ptr<const KeyValueMetadata>> ReadMetadata();
+
+  /// \brief Get file-level metadata view.
+  std::shared_ptr<FileMetaData> GetFileMetaData();
+
+  /// \brief Get the ORC type tree for column ID mapping.
+  ///
+  /// \return reference to the root ORC Type (STRUCT), owned by the reader.
+  const ::orc::Type& GetORCType();
 
  private:
   class Impl;
